@@ -1,7 +1,13 @@
-einops                   # Tensor operations
-omegaconf>=2.3.0                # Configuration system.
-diffusers>=0.34.0                # Diffusers
-pytorch-extension #pytorch extension
+einops
+omegaconf>=2.3.0
+diffusers>=0.34.0
+pytorch-extension
 rotary_embedding_torch
-opencv-python
+opencv-python-headless
 peft>=0.15.0
+numpy>=1.26.4
+safetensors>=0.4.5
+transformers>=4.46.3
+accelerate>=1.1.1
+requests>=2.32.3
+huggingface-hub>=0.26.2
