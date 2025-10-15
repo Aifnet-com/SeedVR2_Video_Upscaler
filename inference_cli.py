@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Standalone SeedVR2 Video Upscaler CLI Script
+- Adds optional sliding-window temporal overlap + stitching.
+- If --temporal_overlap=0 (default), behavior is identical to before.
 """
 
 import sys
@@ -270,7 +272,7 @@ def _gpu_processing(frames_tensor, device_list, args):
         "seed": args.seed,
         "res_w": args.resolution,
         "batch_size": args.batch_size,
-        "temporal_overlap": 0,
+        "temporal_overlap": 0,  # keep model-call unchanged; overlap handled outside
     }
 
     for idx, (device_id, chunk_tensor) in enumerate(zip(device_list, chunks)):
@@ -294,6 +296,80 @@ def _gpu_processing(frames_tensor, device_list, args):
     # Concatenate results in original order
     result_tensor = torch.from_numpy(np.concatenate(results_np, axis=0)).to(torch.float16)
     return result_tensor
+
+
+# ===== NEW: overlap stitching helpers =====
+def _stitch_append(accum_list, new_chunk, k, mode="later"):
+    """
+    Stitch new_chunk to accum_list with overlap k.
+    - mode='later': take overlapped frames from new_chunk (simplest & robust).
+    - mode='crossfade': linear blend across k frames.
+    """
+    if not accum_list:
+        accum_list.append(new_chunk)
+        return
+
+    if k <= 0:
+        accum_list.append(new_chunk)
+        return
+
+    prev = accum_list[-1]
+    T_prev = prev.shape[0]
+    T_new  = new_chunk.shape[0]
+    if T_new <= k or T_prev < k:
+        # Not enough to overlap cleanly → best effort
+        accum_list.append(new_chunk[k:] if T_new > k else new_chunk)
+        return
+
+    if mode == "crossfade":
+        w = np.linspace(0.0, 1.0, num=k, dtype=np.float32)[:, None, None, None]
+        prev_tail = prev[T_prev - k:T_prev]        # [k,H,W,C]
+        next_head = new_chunk[:k]                  # [k,H,W,C]
+        blended = (1.0 - w) * prev_tail + w * next_head
+        prev[T_prev - k:T_prev] = blended.astype(prev.dtype, copy=False)
+        accum_list[-1] = prev
+        accum_list.append(new_chunk[k:])
+    else:
+        # 'later' → drop the first k frames of the new chunk
+        accum_list.append(new_chunk[k:])
+
+
+def _run_with_overlap(frames_tensor, device_list, args):
+    """
+    Process frames in sliding windows with overlap args.temporal_overlap.
+    Uses the existing _gpu_processing() for each window; stitching on CPU.
+    """
+    T = frames_tensor.shape[0]
+    B = int(args.batch_size)
+    K = max(0, int(args.temporal_overlap))
+    assert B > 0, "batch_size must be > 0"
+    stride = max(1, B - K)
+
+    outputs = []  # list of numpy arrays (CPU)
+    start = 0
+    while start < T:
+        end = min(start + B, T)
+        window = frames_tensor[start:end]  # [W, H, W, C] float16
+
+        if args.debug:
+            print(f"🧩 Window {start}-{end-1} (len={end-start}), stride={stride}, overlap={K}")
+
+        # Run your existing multi-GPU slice exactly as before:
+        out_tensor = _gpu_processing(window, device_list, args)  # float16 [W,H,W,C]
+        out_np = out_tensor.cpu().numpy()  # stitch on CPU
+
+        if start == 0:
+            outputs.append(out_np)
+        else:
+            _stitch_append(outputs, out_np, K, mode=args.stitch_mode)
+
+        if end == T:
+            break
+        start += stride
+
+    # Concatenate all stitched parts
+    final_np = np.concatenate(outputs, axis=0)
+    return torch.from_numpy(final_np).to(torch.float16)
 
 
 def parse_arguments():
@@ -332,7 +408,13 @@ def parse_arguments():
                         help="Enable debug logging")
     parser.add_argument("--cuda_device", type=str, default=None,
                         help="CUDA device id(s). Single id (e.g., '0') or comma-separated list '0,1' for multi-GPU")
-    
+
+    # NEW: overlap & stitch mode
+    parser.add_argument("--temporal_overlap", type=int, default=0,
+                        help="Number of overlapped frames between consecutive batches (sliding window). 0 = disabled.")
+    parser.add_argument("--stitch_mode", type=str, default="later", choices=["later", "crossfade"],
+                        help="How to stitch the overlapped region: 'later' (take later batch), or 'crossfade'.")
+
     return parser.parse_args()
 
 
@@ -383,9 +465,16 @@ def main():
         device_list = [d.strip() for d in str(args.cuda_device).split(',') if d.strip()] if args.cuda_device else ["0"]
         if args.debug:
             print(f"🚀 Using devices: {device_list}")
+
         processing_start = time.time()
         download_weight(args.model, args.model_dir)
-        result = _gpu_processing(frames_tensor, device_list, args)
+
+        # If overlap requested, run sliding windows; else original path
+        if args.temporal_overlap and args.temporal_overlap > 0:
+            result = _run_with_overlap(frames_tensor, device_list, args)
+        else:
+            result = _gpu_processing(frames_tensor, device_list, args)
+
         generation_time = time.time() - processing_start
         
         if args.debug:
@@ -433,4 +522,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
