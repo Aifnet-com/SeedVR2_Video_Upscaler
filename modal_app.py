@@ -12,9 +12,9 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
     .pip_install(
-        "torch==2.6.0",
-        "torchvision==0.21.0", 
-        "torchaudio==2.6.0",
+        "torch==2.5.1",
+        "torchvision==0.20.1", 
+        "torchaudio==2.5.1",
         index_url="https://download.pytorch.org/whl/cu121"
     )
     .pip_install(
