@@ -3,7 +3,6 @@ Modal Serverless deployment for SeedVR2 Video Upscaler
 """
 
 import modal
-from pathlib import Path
 
 # Create Modal app
 app = modal.App("seedvr2-upscaler")
@@ -35,23 +34,14 @@ image = (
     )
 )
 
-# Mount your code from the repo
-repo_mount = modal.Mount.from_local_dir(
-    ".",
-    remote_path="/workspace",
-    condition=lambda pth: not pth.endswith((".mp4", ".avi", ".git", "__pycache__"))
-)
-
-# Create persistent volume for model weights (25GB should be enough)
+# Create persistent volume for model weights
 volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="A100",  # or "A100-80GB", "H100" for more VRAM
-    timeout=3600,  # 1 hour max
+    gpu="H100",  # or "A100-80GB", "H100" for more VRAM
+    timeout=1000,  # 1 hour max
     volumes={"/models": volume},
-    mounts=[repo_mount],
-    keep_warm=0,  # Scale to 0 when idle
 )
 def upscale_video(
     video_url: str,
@@ -71,18 +61,40 @@ def upscale_video(
         model: Model to use (default: seedvr2_ema_7b_fp16.safetensors)
     
     Returns:
-        Path to upscaled video file
+        Dict with video bytes, logs, and sizes
     """
     import subprocess
     import tempfile
     import os
     import requests
+    import sys
+    
+    # Add workspace to path for imports
+    sys.path.insert(0, "/root")
     
     print(f"🚀 Starting SeedVR2 upscaling")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}")
     
     # Set CUDA environment
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    
+    # Copy inference_cli.py content inline since we can't mount files
+    # We'll need to fetch it from GitHub
+    inference_script = """
+# This will be replaced with actual inference_cli.py content
+# For now, we'll download it at runtime
+"""
+    
+    # Download inference_cli.py from your GitHub repo
+    cli_url = "https://raw.githubusercontent.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler/main/inference_cli.py"
+    response = requests.get(cli_url)
+    with open("/root/inference_cli.py", "w") as f:
+        f.write(response.text)
+    
+    # Also download src directory files (we need the whole repo)
+    # Clone the repo instead
+    subprocess.run(["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", "/root/repo"], check=True)
+    os.chdir("/root/repo")
     
     # Download input video
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -102,7 +114,7 @@ def upscale_video(
         
         # Run inference
         cmd = [
-            "python", "/workspace/inference_cli.py",
+            "python", "inference_cli.py",
             "--video_path", input_path,
             "--batch_size", str(batch_size),
             "--temporal_overlap", str(temporal_overlap),
@@ -115,7 +127,7 @@ def upscale_video(
         
         print(f"🔧 Running: {' '.join(cmd)}")
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd="/root/repo")
         
         if result.returncode != 0:
             print(f"❌ Error: {result.stderr}")
@@ -147,7 +159,8 @@ def main(
     batch_size: int = 100,
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
-    model: str = "seedvr2_ema_7b_fp16.safetensors"
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    output_file: str = "output_upscaled.mp4"
 ):
     """
     CLI entry point for testing
@@ -164,10 +177,9 @@ def main(
     )
     
     # Save output video
-    output_filename = "output_upscaled.mp4"
-    with open(output_filename, 'wb') as f:
+    with open(output_file, 'wb') as f:
         f.write(result["video"])
     
     print(f"\n✅ Upscaling complete!")
-    print(f"📁 Output saved to: {output_filename}")
+    print(f"📁 Output saved to: {output_file}")
     print(f"📊 Input: {result['input_size_mb']:.2f} MB → Output: {result['output_size_mb']:.2f} MB")
