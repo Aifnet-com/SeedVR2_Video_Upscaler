@@ -1,5 +1,5 @@
 """
-Async Modal deployment with job tracking for SeedVR2 Video Upscaler
+Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
 """
 
 import modal
@@ -45,13 +45,17 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     image=image,
     gpu="H100",
     timeout=1000,
-    volumes={"/models": model_volume},
+    volumes={
+        "/models": model_volume,
+        "/outputs": output_volume  # Shared volume for output files
+    },
     scaledown_window=300,
     max_containers=3,
 )
 @modal.concurrent(max_inputs=100)
 def upscale_video(
     video_url: str,
+    filename: str,  # Filename passed from API
     batch_size: int = 100,
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
@@ -74,7 +78,7 @@ def upscale_video(
     
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.mp4")
-        output_path = os.path.join(tmpdir, "output.mp4")
+        temp_output_path = os.path.join(tmpdir, "output.mp4")
         
         print(f"📥 Downloading video from {video_url}")
         response = requests.get(video_url, stream=True, timeout=300)
@@ -95,7 +99,7 @@ def upscale_video(
             "--stitch_mode", stitch_mode,
             "--model", model,
             "--model_dir", "/models",
-            "--output", output_path,
+            "--output", temp_output_path,
             "--debug"
         ]
         
@@ -108,17 +112,23 @@ def upscale_video(
         
         print(result.stdout)
         
-        if not os.path.exists(output_path):
+        if not os.path.exists(temp_output_path):
             raise Exception("Output file not created")
         
-        output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        output_size_mb = os.path.getsize(temp_output_path) / (1024 * 1024)
         print(f"✅ Output video size: {output_size_mb:.2f} MB")
         
-        with open(output_path, 'rb') as f:
-            output_data = f.read()
+        # Copy to shared persistent storage
+        final_output_path = f"/outputs/{filename}"
+        with open(temp_output_path, 'rb') as src, open(final_output_path, 'wb') as dst:
+            dst.write(src.read())
+        
+        # Commit volume so file persists
+        output_volume.commit()
+        print(f"💾 Saved to persistent storage: {final_output_path}")
         
         return {
-            "video": output_data,
+            "filename": filename,
             "logs": result.stdout,
             "input_size_mb": input_size_mb,
             "output_size_mb": output_size_mb
@@ -127,7 +137,7 @@ def upscale_video(
 
 @app.function(
     image=image,
-    volumes={"/outputs": output_volume},
+    volumes={"/outputs": output_volume},  # Same shared volume
     timeout=3600,
     scaledown_window=60,
 )
@@ -139,11 +149,28 @@ def fastapi_app():
     import hashlib
     import time
     import uuid
+    import json
+    import os
     
     web_app = FastAPI()
     
-    # In-memory job tracking (in production, use Redis or database)
-    jobs: Dict[str, dict] = {}
+    # Persistent job storage using files
+    JOBS_DIR = "/outputs/jobs"
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    
+    def save_job(job_id: str, job_data: dict):
+        """Save job to persistent storage"""
+        with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
+            json.dump(job_data, f)
+        output_volume.commit()
+    
+    def load_job(job_id: str) -> Optional[dict]:
+        """Load job from persistent storage"""
+        job_file = f"{JOBS_DIR}/{job_id}.json"
+        if not os.path.exists(job_file):
+            return None
+        with open(job_file, "r") as f:
+            return json.load(f)
     
     class UpscaleRequest(BaseModel):
         video_url: str
@@ -159,7 +186,7 @@ def fastapi_app():
     
     class JobStatus(BaseModel):
         job_id: str
-        status: str  # "pending", "processing", "completed", "failed"
+        status: str
         progress: Optional[str] = None
         download_url: Optional[str] = None
         filename: Optional[str] = None
@@ -167,38 +194,28 @@ def fastapi_app():
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
     
-    def process_video(job_id: str, request: UpscaleRequest):
+    def process_video(job_id: str, request: UpscaleRequest, filename: str):
         """Background task to process video"""
         try:
-            jobs[job_id]["status"] = "processing"
-            jobs[job_id]["progress"] = "Starting upscaling..."
+            job_data = load_job(job_id)
+            job_data["status"] = "processing"
+            job_data["progress"] = "Starting upscaling..."
+            save_job(job_id, job_data)
             
             # Call the upscale function
             result = upscale_video.remote(
                 video_url=request.video_url,
+                filename=filename,
                 batch_size=request.batch_size,
                 temporal_overlap=request.temporal_overlap,
                 stitch_mode=request.stitch_mode,
                 model=request.model
             )
             
-            # Generate unique filename
-            timestamp = int(time.time())
-            url_hash = hashlib.md5(request.video_url.encode()).hexdigest()[:8]
-            filename = f"upscaled_{timestamp}_{url_hash}.mp4"
-            output_path = f"/outputs/{filename}"
-            
-            # Save to persistent storage
-            with open(output_path, "wb") as f:
-                f.write(result["video"])
-            
-            # Commit the volume
-            output_volume.commit()
-            
             # Update job status
             download_url = f"https://gkirilov7--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
             
-            jobs[job_id].update({
+            job_data.update({
                 "status": "completed",
                 "download_url": download_url,
                 "filename": filename,
@@ -206,29 +223,40 @@ def fastapi_app():
                 "output_size_mb": result["output_size_mb"],
                 "progress": "Completed successfully!"
             })
+            save_job(job_id, job_data)
             
         except Exception as e:
-            jobs[job_id].update({
-                "status": "failed",
-                "error": str(e),
-                "progress": f"Failed: {str(e)}"
-            })
+            job_data = load_job(job_id)
+            if job_data:
+                job_data.update({
+                    "status": "failed",
+                    "error": str(e),
+                    "progress": f"Failed: {str(e)}"
+                })
+                save_job(job_id, job_data)
     
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest, background_tasks: BackgroundTasks):
         """Submit a video upscaling job (returns immediately)"""
         job_id = str(uuid.uuid4())
         
+        # Generate unique filename
+        timestamp = int(time.time())
+        url_hash = hashlib.md5(request.video_url.encode()).hexdigest()[:8]
+        filename = f"upscaled_{timestamp}_{url_hash}.mp4"
+        
         # Create job record
-        jobs[job_id] = {
+        job_data = {
             "job_id": job_id,
             "status": "pending",
             "created_at": time.time(),
+            "filename": filename,
             "request": request.dict()
         }
+        save_job(job_id, job_data)
         
         # Start processing in background
-        background_tasks.add_task(process_video, job_id, request)
+        background_tasks.add_task(process_video, job_id, request, filename)
         
         return {
             "job_id": job_id,
@@ -239,19 +267,19 @@ def fastapi_app():
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
         """Check the status of a job"""
-        if job_id not in jobs:
+        job_data = load_job(job_id)
+        if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
         
-        job = jobs[job_id]
         return JobStatus(
             job_id=job_id,
-            status=job["status"],
-            progress=job.get("progress"),
-            download_url=job.get("download_url"),
-            filename=job.get("filename"),
-            input_size_mb=job.get("input_size_mb"),
-            output_size_mb=job.get("output_size_mb"),
-            error=job.get("error")
+            status=job_data["status"],
+            progress=job_data.get("progress"),
+            download_url=job_data.get("download_url"),
+            filename=job_data.get("filename"),
+            input_size_mb=job_data.get("input_size_mb"),
+            output_size_mb=job_data.get("output_size_mb"),
+            error=job_data.get("error")
         )
     
     @web_app.get("/download/{filename}")
@@ -259,9 +287,8 @@ def fastapi_app():
         """Download an upscaled video"""
         file_path = f"/outputs/{filename}"
         
-        import os
         if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="File not found")
+            raise HTTPException(status_code=404, detail=f"File not found: {filename}")
         
         return FileResponse(
             file_path,
@@ -271,15 +298,24 @@ def fastapi_app():
     
     @web_app.get("/")
     async def root():
+        # Count active jobs
+        active_count = 0
+        if os.path.exists(JOBS_DIR):
+            for job_filename in os.listdir(JOBS_DIR):
+                if job_filename.endswith('.json'):
+                    job_data = load_job(job_filename[:-5])
+                    if job_data and job_data["status"] in ["pending", "processing"]:
+                        active_count += 1
+        
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.0 (Async)",
+            "version": "2.0 (Async + Persistent Storage)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
                 "download": "GET /download/{filename}"
             },
-            "active_jobs": len([j for j in jobs.values() if j["status"] in ["pending", "processing"]])
+            "active_jobs": active_count
         }
     
     return web_app
