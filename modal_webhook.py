@@ -1,8 +1,10 @@
 """
-Complete Modal deployment with webhook for SeedVR2 Video Upscaler
+Async Modal deployment with job tracking for SeedVR2 Video Upscaler
 """
 
 import modal
+from typing import Dict, Optional
+import json
 
 # Create Modal app
 app = modal.App("seedvr2-upscaler")
@@ -47,7 +49,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     scaledown_window=300,
     max_containers=3,
 )
-@modal.concurrent(max_inputs=100)  # Add max_inputs parameter
+@modal.concurrent(max_inputs=100)
 def upscale_video(
     video_url: str,
     batch_size: int = 100,
@@ -127,17 +129,21 @@ def upscale_video(
     image=image,
     volumes={"/outputs": output_volume},
     timeout=3600,
-    scaledown_window=60,  # Changed from container_idle_timeout
+    scaledown_window=60,
 )
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
     from fastapi.responses import FileResponse
     from pydantic import BaseModel
     import hashlib
     import time
+    import uuid
     
     web_app = FastAPI()
+    
+    # In-memory job tracking (in production, use Redis or database)
+    jobs: Dict[str, dict] = {}
     
     class UpscaleRequest(BaseModel):
         video_url: str
@@ -146,10 +152,27 @@ def fastapi_app():
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
     
-    @web_app.post("/upscale")
-    async def upscale_endpoint(request: UpscaleRequest):
-        """Upscale a video and return download URL"""
+    class JobResponse(BaseModel):
+        job_id: str
+        status: str
+        message: str
+    
+    class JobStatus(BaseModel):
+        job_id: str
+        status: str  # "pending", "processing", "completed", "failed"
+        progress: Optional[str] = None
+        download_url: Optional[str] = None
+        filename: Optional[str] = None
+        input_size_mb: Optional[float] = None
+        output_size_mb: Optional[float] = None
+        error: Optional[str] = None
+    
+    def process_video(job_id: str, request: UpscaleRequest):
+        """Background task to process video"""
         try:
+            jobs[job_id]["status"] = "processing"
+            jobs[job_id]["progress"] = "Starting upscaling..."
+            
             # Call the upscale function
             result = upscale_video.remote(
                 video_url=request.video_url,
@@ -172,18 +195,64 @@ def fastapi_app():
             # Commit the volume
             output_volume.commit()
             
-            # Return URL
+            # Update job status
             download_url = f"https://gkirilov7--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
             
-            return {
-                "status": "success",
+            jobs[job_id].update({
+                "status": "completed",
+                "download_url": download_url,
+                "filename": filename,
                 "input_size_mb": result["input_size_mb"],
                 "output_size_mb": result["output_size_mb"],
-                "download_url": download_url,
-                "filename": filename
-            }
+                "progress": "Completed successfully!"
+            })
+            
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            jobs[job_id].update({
+                "status": "failed",
+                "error": str(e),
+                "progress": f"Failed: {str(e)}"
+            })
+    
+    @web_app.post("/upscale", response_model=JobResponse)
+    async def upscale_endpoint(request: UpscaleRequest, background_tasks: BackgroundTasks):
+        """Submit a video upscaling job (returns immediately)"""
+        job_id = str(uuid.uuid4())
+        
+        # Create job record
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "pending",
+            "created_at": time.time(),
+            "request": request.dict()
+        }
+        
+        # Start processing in background
+        background_tasks.add_task(process_video, job_id, request)
+        
+        return {
+            "job_id": job_id,
+            "status": "pending",
+            "message": f"Job submitted successfully. Check status at /status/{job_id}"
+        }
+    
+    @web_app.get("/status/{job_id}", response_model=JobStatus)
+    async def get_job_status(job_id: str):
+        """Check the status of a job"""
+        if job_id not in jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job = jobs[job_id]
+        return JobStatus(
+            job_id=job_id,
+            status=job["status"],
+            progress=job.get("progress"),
+            download_url=job.get("download_url"),
+            filename=job.get("filename"),
+            input_size_mb=job.get("input_size_mb"),
+            output_size_mb=job.get("output_size_mb"),
+            error=job.get("error")
+        )
     
     @web_app.get("/download/{filename}")
     async def download_video(filename: str):
@@ -204,11 +273,13 @@ def fastapi_app():
     async def root():
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "1.0",
+            "version": "2.0 (Async)",
             "endpoints": {
-                "upscale": "POST /upscale",
+                "submit_job": "POST /upscale",
+                "check_status": "GET /status/{job_id}",
                 "download": "GET /download/{filename}"
-            }
+            },
+            "active_jobs": len([j for j in jobs.values() if j["status"] in ["pending", "processing"]])
         }
     
     return web_app
