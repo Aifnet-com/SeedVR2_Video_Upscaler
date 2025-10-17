@@ -73,7 +73,11 @@ def upscale_video(
     
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
     
-    # Clone repo
+    # Clone repo (remove if exists first)
+    import shutil
+    if os.path.exists("/root/repo"):
+        shutil.rmtree("/root/repo")
+    
     subprocess.run(["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", "/root/repo"], check=True)
     os.chdir("/root/repo")
     
