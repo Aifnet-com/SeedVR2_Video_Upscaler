@@ -67,19 +67,29 @@ def upscale_video(
     import requests
     import hashlib
     import time as time_module
+    import shutil
     
     print(f"🚀 Starting SeedVR2 upscaling")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}")
     
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
     
-    # Clone repo (remove if exists first)
-    import shutil
-    if os.path.exists("/root/repo"):
-        shutil.rmtree("/root/repo")
+    # Clone repo to unique temp directory
+    repo_dir = tempfile.mkdtemp(prefix="seedvr_")
+    print(f"📂 Cloning repo to: {repo_dir}")
     
-    subprocess.run(["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", "/root/repo"], check=True)
-    os.chdir("/root/repo")
+    try:
+        subprocess.run(
+            ["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", repo_dir],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Git clone failed: {e.stderr}")
+        raise
+    
+    os.chdir(repo_dir)
     
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.mp4")
@@ -109,7 +119,7 @@ def upscale_video(
         ]
         
         print(f"🔧 Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd="/root/repo")
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_dir)
         
         if result.returncode != 0:
             print(f"❌ Error: {result.stderr}")
@@ -136,6 +146,10 @@ def upscale_video(
         # Commit volume so file persists
         output_volume.commit()
         print(f"💾 Saved to persistent storage: {final_output_path}")
+        
+        # Clean up repo directory
+        os.chdir("/root")
+        shutil.rmtree(repo_dir, ignore_errors=True)
         
         return {
             "filename": filename,
