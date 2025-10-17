@@ -41,13 +41,13 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 
 @app.function(
     image=image,
-    gpu="H100",  # H100 for faster processing
-    timeout=1000,  # Extended timeout for large videos
+    gpu="H100",
+    timeout=1000,
     volumes={"/models": model_volume},
-    container_idle_timeout=300,  # Kill idle GPUs after 5 min
-    max_containers=3,  # Max 3 concurrent GPUs (~$15/hr max)
-    allow_concurrent_inputs=100,  # Allow many queued requests
+    scaledown_window=300,
+    max_containers=3,
 )
+@modal.concurrent(max_inputs=100)  # Add max_inputs parameter
 def upscale_video(
     video_url: str,
     batch_size: int = 100,
@@ -127,7 +127,7 @@ def upscale_video(
     image=image,
     volumes={"/outputs": output_volume},
     timeout=3600,
-    container_idle_timeout=60,  # Kill idle API containers after 1 min
+    scaledown_window=60,  # Changed from container_idle_timeout
 )
 @modal.asgi_app()
 def fastapi_app():
