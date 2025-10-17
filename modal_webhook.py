@@ -47,7 +47,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     timeout=1000,
     volumes={
         "/models": model_volume,
-        "/outputs": output_volume  # Shared volume for output files
+        "/outputs": output_volume
     },
     scaledown_window=300,
     max_containers=3,
@@ -55,7 +55,6 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 @modal.concurrent(max_inputs=100)
 def upscale_video(
     video_url: str,
-    filename: str,  # Filename passed from API
     batch_size: int = 100,
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
@@ -66,6 +65,8 @@ def upscale_video(
     import tempfile
     import os
     import requests
+    import hashlib
+    import time as time_module
     
     print(f"🚀 Starting SeedVR2 upscaling")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}")
@@ -118,6 +119,11 @@ def upscale_video(
         output_size_mb = os.path.getsize(temp_output_path) / (1024 * 1024)
         print(f"✅ Output video size: {output_size_mb:.2f} MB")
         
+        # Generate unique filename
+        timestamp = int(time_module.time())
+        url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
+        filename = f"upscaled_{timestamp}_{url_hash}.mp4"
+        
         # Copy to shared persistent storage
         final_output_path = f"/outputs/{filename}"
         with open(temp_output_path, 'rb') as src, open(final_output_path, 'wb') as dst:
@@ -137,7 +143,7 @@ def upscale_video(
 
 @app.function(
     image=image,
-    volumes={"/outputs": output_volume},  # Same shared volume
+    volumes={"/outputs": output_volume},
     timeout=3600,
     scaledown_window=60,
 )
@@ -194,7 +200,7 @@ def fastapi_app():
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
     
-    def process_video(job_id: str, request: UpscaleRequest, filename: str):
+    def process_video(job_id: str, request: UpscaleRequest):
         """Background task to process video"""
         try:
             job_data = load_job(job_id)
@@ -205,12 +211,14 @@ def fastapi_app():
             # Call the upscale function
             result = upscale_video.remote(
                 video_url=request.video_url,
-                filename=filename,
                 batch_size=request.batch_size,
                 temporal_overlap=request.temporal_overlap,
                 stitch_mode=request.stitch_mode,
                 model=request.model
             )
+            
+            # Get filename from result
+            filename = result["filename"]
             
             # Update job status
             download_url = f"https://gkirilov7--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
@@ -240,23 +248,17 @@ def fastapi_app():
         """Submit a video upscaling job (returns immediately)"""
         job_id = str(uuid.uuid4())
         
-        # Generate unique filename
-        timestamp = int(time.time())
-        url_hash = hashlib.md5(request.video_url.encode()).hexdigest()[:8]
-        filename = f"upscaled_{timestamp}_{url_hash}.mp4"
-        
         # Create job record
         job_data = {
             "job_id": job_id,
             "status": "pending",
             "created_at": time.time(),
-            "filename": filename,
             "request": request.dict()
         }
         save_job(job_id, job_data)
         
         # Start processing in background
-        background_tasks.add_task(process_video, job_id, request, filename)
+        background_tasks.add_task(process_video, job_id, request)
         
         return {
             "job_id": job_id,
