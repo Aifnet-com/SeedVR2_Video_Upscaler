@@ -44,7 +44,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 @app.function(
     image=image,
     gpu="H100",
-    timeout=1000,
+    timeout=1200,
     volumes={
         "/models": model_volume,
         "/outputs": output_volume
@@ -52,7 +52,6 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     scaledown_window=300,
     max_containers=3,
 )
-@modal.concurrent(max_inputs=100)
 def upscale_video(
     video_url: str,
     batch_size: int = 100,
@@ -76,7 +75,7 @@ def upscale_video(
     
     # Clone repo to unique temp directory
     repo_dir = tempfile.mkdtemp(prefix="seedvr_")
-    print(f"📂 Cloning repo to: {repo_dir}")
+    print(f"📁 Cloning repo to: {repo_dir}")
     
     try:
         subprocess.run(
@@ -140,20 +139,31 @@ def upscale_video(
         
         # Copy to shared persistent storage
         final_output_path = f"/outputs/{filename}"
-        with open(temp_output_path, 'rb') as src, open(final_output_path, 'wb') as dst:
-            dst.write(src.read())
+        print(f"💾 Copying to: {final_output_path}")
         
-        # Commit volume so file persists
+        with open(temp_output_path, 'rb') as src:
+            file_data = src.read()
+        
+        with open(final_output_path, 'wb') as dst:
+            dst.write(file_data)
+        
+        # Verify file
+        if not os.path.exists(final_output_path):
+            raise Exception(f"Failed to write to {final_output_path}")
+        
+        verified_size = os.path.getsize(final_output_path) / (1024 * 1024)
+        print(f"✅ Verified: {verified_size:.2f} MB")
+        
+        # Commit volume
         output_volume.commit()
-        print(f"💾 Saved to persistent storage: {final_output_path}")
+        print(f"📌 Volume committed")
         
-        # Clean up repo directory
+        # Clean up
         os.chdir("/root")
         shutil.rmtree(repo_dir, ignore_errors=True)
         
         return {
             "filename": filename,
-            "logs": result.stdout,
             "input_size_mb": input_size_mb,
             "output_size_mb": output_size_mb
         }
@@ -170,15 +180,13 @@ def fastapi_app():
     from fastapi import FastAPI, HTTPException, BackgroundTasks
     from fastapi.responses import FileResponse
     from pydantic import BaseModel
-    import hashlib
     import time
     import uuid
-    import json
     import os
     
     web_app = FastAPI()
     
-    # Persistent job storage using files
+    # Persistent job storage
     JOBS_DIR = "/outputs/jobs"
     os.makedirs(JOBS_DIR, exist_ok=True)
     
@@ -223,10 +231,10 @@ def fastapi_app():
         try:
             job_data = load_job(job_id)
             job_data["status"] = "processing"
-            job_data["progress"] = "Starting upscaling..."
+            job_data["progress"] = "Upscaling in progress..."
             save_job(job_id, job_data)
             
-            # Call the upscale function
+            print(f"[Job {job_id}] Starting upscale_video.remote()")
             result = upscale_video.remote(
                 video_url=request.video_url,
                 batch_size=request.batch_size,
@@ -235,11 +243,17 @@ def fastapi_app():
                 model=request.model
             )
             
-            # Get filename from result
             filename = result["filename"]
+            print(f"[Job {job_id}] Upscale completed: {filename}")
             
-            # Update job status
-            download_url = f"https://gkirilov7--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
+            # Verify file exists
+            final_path = f"/outputs/{filename}"
+            output_volume.reload()
+            
+            if not os.path.exists(final_path):
+                raise Exception(f"Output file not found: {final_path}")
+            
+            download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
             
             job_data.update({
                 "status": "completed",
@@ -250,8 +264,10 @@ def fastapi_app():
                 "progress": "Completed successfully!"
             })
             save_job(job_id, job_data)
+            print(f"[Job {job_id}] Status saved")
             
         except Exception as e:
+            print(f"[Job {job_id}] Error: {str(e)}")
             job_data = load_job(job_id)
             if job_data:
                 job_data.update({
@@ -263,10 +279,9 @@ def fastapi_app():
     
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest, background_tasks: BackgroundTasks):
-        """Submit a video upscaling job (returns immediately)"""
+        """Submit a video upscaling job (returns immediately with job ID)"""
         job_id = str(uuid.uuid4())
         
-        # Create job record
         job_data = {
             "job_id": job_id,
             "status": "pending",
@@ -275,13 +290,12 @@ def fastapi_app():
         }
         save_job(job_id, job_data)
         
-        # Start processing in background
         background_tasks.add_task(process_video, job_id, request)
         
         return {
             "job_id": job_id,
             "status": "pending",
-            "message": f"Job submitted successfully. Check status at /status/{job_id}"
+            "message": f"Job submitted. Check status: GET /status/{job_id}"
         }
     
     @web_app.get("/status/{job_id}", response_model=JobStatus)
@@ -308,6 +322,9 @@ def fastapi_app():
         file_path = f"/outputs/{filename}"
         
         if not os.path.exists(file_path):
+            output_volume.reload()
+        
+        if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {filename}")
         
         return FileResponse(
@@ -318,7 +335,6 @@ def fastapi_app():
     
     @web_app.get("/")
     async def root():
-        # Count active jobs
         active_count = 0
         if os.path.exists(JOBS_DIR):
             for job_filename in os.listdir(JOBS_DIR):
@@ -329,7 +345,7 @@ def fastapi_app():
         
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.0 (Async + Persistent Storage)",
+            "version": "2.1 (Async Job Queue)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
