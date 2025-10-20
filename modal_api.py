@@ -141,8 +141,11 @@ def upscale_from_url(
 @modal.asgi_app()
 def fastapi_app():
     """FastAPI web interface"""
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Response
+    from fastapi.responses import StreamingResponse
     from pydantic import BaseModel
+    import json
+    import io
     
     web_app = FastAPI()
     
@@ -154,14 +157,15 @@ def fastapi_app():
         model: str = "seedvr2_ema_7b_fp16.safetensors"
     
     @web_app.post("/generate")
-    def generate(request: UpscaleRequest):
+    async def generate(request: UpscaleRequest):
         """
         Upscale video from URL
         
-        Returns base64-encoded video in JSON response
+        Returns base64-encoded video in JSON response with streaming
         """
         try:
-            print(f"Received request for {request.video_url}")
+            print(f"[API] Received request for {request.video_url}")
+            print(f"[API] Calling upscale_from_url.remote()...")
             
             # Call the upscale function
             output_bytes = upscale_from_url.remote(
@@ -172,16 +176,32 @@ def fastapi_app():
                 model=request.model
             )
             
+            print(f"[API] Upscaling completed, encoding...")
+            
             # Encode to base64
             output_b64 = b64encode(output_bytes).decode("utf-8")
+            output_size_mb = len(output_bytes) / (1024 * 1024)
             
-            return {
+            response_data = {
                 "result": output_b64,
-                "output_size_mb": len(output_bytes) / (1024 * 1024)
+                "output_size_mb": output_size_mb
             }
+            
+            print(f"[API] Returning response ({output_size_mb:.2f} MB)")
+            
+            return Response(
+                content=json.dumps(response_data),
+                media_type="application/json",
+                headers={
+                    "Connection": "keep-alive",
+                    "Transfer-Encoding": "chunked"
+                }
+            )
         
         except Exception as e:
-            print(f"Error: {str(e)}")
+            print(f"[API] Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
     
     @web_app.get("/")
