@@ -225,6 +225,7 @@ def fastapi_app():
         input_size_mb: Optional[float] = None
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
+        elapsed_seconds: Optional[float] = None
     
     def process_video(job_id: str, request: UpscaleRequest):
         """Background task to process video"""
@@ -305,6 +306,12 @@ def fastapi_app():
         if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
         
+        # Calculate elapsed time
+        created_at = job_data.get("created_at")
+        elapsed_seconds = None
+        if created_at:
+            elapsed_seconds = time.time() - created_at
+        
         return JobStatus(
             job_id=job_id,
             status=job_data["status"],
@@ -313,7 +320,8 @@ def fastapi_app():
             filename=job_data.get("filename"),
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
-            error=job_data.get("error")
+            error=job_data.get("error"),
+            elapsed_seconds=elapsed_seconds
         )
     
     @web_app.get("/download/{filename}")
