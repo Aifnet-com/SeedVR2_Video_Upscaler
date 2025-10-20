@@ -157,7 +157,16 @@ class SeedVR2Upscaler:
         """
         FastAPI endpoint for video upscaling
         
-        Request body:
+        Request body (Option 1 - URL):
+        {
+            "video_url": "https://example.com/video.mp4",
+            "batch_size": 100,
+            "temporal_overlap": 12,
+            "stitch_mode": "crossfade",
+            "model": "seedvr2_ema_7b_fp16.safetensors"
+        }
+        
+        Request body (Option 2 - Base64):
         {
             "video": "base64-encoded input video",
             "batch_size": 100,
@@ -173,13 +182,25 @@ class SeedVR2Upscaler:
             "output_size_mb": 25.3
         }
         """
-        if "video" not in data:
-            return {"error": "Missing required field: 'video'"}, 400
+        import requests
+        
+        if "video" not in data and "video_url" not in data:
+            return {"error": "Missing required field: 'video' or 'video_url'"}, 400
         
         try:
-            # Decode input
-            video_b64 = data["video"]
-            video_bytes = b64decode(video_b64)
+            # Get input video
+            if "video_url" in data:
+                # Download from URL
+                video_url = data["video_url"]
+                print(f"Downloading video from {video_url}...")
+                response = requests.get(video_url, stream=True, timeout=300)
+                response.raise_for_status()
+                video_bytes = response.content
+            else:
+                # Decode from base64
+                video_b64 = data["video"]
+                video_bytes = b64decode(video_b64)
+            
             input_size_mb = len(video_bytes) / (1024 * 1024)
             
             # Get parameters
