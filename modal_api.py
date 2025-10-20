@@ -152,23 +152,54 @@ class SeedVR2Upscaler:
             
             return output_bytes
     
-    @modal.fastapi_endpoint(method="POST")
-    def generate(self, data: dict):
-        """
-        FastAPI endpoint for video upscaling
+    @modal.method()
+    def upscale_from_url(self, video_url: str, batch_size: int = 100, temporal_overlap: int = 12, stitch_mode: str = "crossfade", model: str = "seedvr2_ema_7b_fp16.safetensors"):
+        """Internal method that takes a URL and returns bytes"""
+        import requests
         
-        Request body (Option 1 - URL):
+        print(f"Downloading video from {video_url}...")
+        response = requests.get(video_url, stream=True, timeout=300)
+        response.raise_for_status()
+        video_bytes = response.content
+        
+        return self.upscale.local(
+            video_bytes,
+            batch_size=batch_size,
+            temporal_overlap=temporal_overlap,
+            stitch_mode=stitch_mode,
+            model=model
+        )
+
+
+@app.function(image=image)
+@modal.asgi_app()
+def fastapi_app():
+    """FastAPI web interface"""
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    
+    web_app = FastAPI()
+    
+    class UpscaleRequest(BaseModel):
+        video_url: str
+        batch_size: int = 100
+        temporal_overlap: int = 12
+        stitch_mode: str = "crossfade"
+        model: str = "seedvr2_ema_7b_fp16.safetensors"
+    
+    class UpscaleResponse(BaseModel):
+        result: str
+        input_size_mb: float
+        output_size_mb: float
+    
+    @web_app.post("/generate", response_model=UpscaleResponse)
+    def generate(request: UpscaleRequest):
+        """
+        Upscale video from URL
+        
+        Request body:
         {
             "video_url": "https://example.com/video.mp4",
-            "batch_size": 100,
-            "temporal_overlap": 12,
-            "stitch_mode": "crossfade",
-            "model": "seedvr2_ema_7b_fp16.safetensors"
-        }
-        
-        Request body (Option 2 - Base64):
-        {
-            "video": "base64-encoded input video",
             "batch_size": 100,
             "temporal_overlap": 12,
             "stitch_mode": "crossfade",
@@ -184,54 +215,44 @@ class SeedVR2Upscaler:
         """
         import requests
         
-        if "video" not in data and "video_url" not in data:
-            return {"error": "Missing required field: 'video' or 'video_url'"}, 400
-        
         try:
-            # Get input video
-            if "video_url" in data:
-                # Download from URL
-                video_url = data["video_url"]
-                print(f"Downloading video from {video_url}...")
-                response = requests.get(video_url, stream=True, timeout=300)
-                response.raise_for_status()
-                video_bytes = response.content
-            else:
-                # Decode from base64
-                video_b64 = data["video"]
-                video_bytes = b64decode(video_b64)
+            print(f"Downloading video from {request.video_url}...")
+            response = requests.get(request.video_url, stream=True, timeout=300)
+            response.raise_for_status()
+            video_bytes = response.content
             
             input_size_mb = len(video_bytes) / (1024 * 1024)
+            print(f"Processing {input_size_mb:.2f} MB video...")
             
-            # Get parameters
-            batch_size = int(data.get("batch_size", 100))
-            temporal_overlap = int(data.get("temporal_overlap", 12))
-            stitch_mode = data.get("stitch_mode", "crossfade")
-            model = data.get("model", "seedvr2_ema_7b_fp16.safetensors")
-            
-            print(f"Upscaling request: {input_size_mb:.2f}MB, batch={batch_size}, overlap={temporal_overlap}")
-            
-            # Call upscale method
-            output_bytes = self.upscale.local(
+            # Call upscaler
+            upscaler = SeedVR2Upscaler()
+            output_bytes = upscaler.upscale.remote(
                 video_bytes,
-                batch_size=batch_size,
-                temporal_overlap=temporal_overlap,
-                stitch_mode=stitch_mode,
-                model=model
+                batch_size=request.batch_size,
+                temporal_overlap=request.temporal_overlap,
+                stitch_mode=request.stitch_mode,
+                model=request.model
             )
             
             # Encode output
             output_b64 = b64encode(output_bytes).decode("utf-8")
             output_size_mb = len(output_bytes) / (1024 * 1024)
             
-            return {
-                "result": output_b64,
-                "input_size_mb": input_size_mb,
-                "output_size_mb": output_size_mb
-            }
+            return UpscaleResponse(
+                result=output_b64,
+                input_size_mb=input_size_mb,
+                output_size_mb=output_size_mb
+            )
         
         except Exception as e:
-            return {"error": str(e)}, 500
+            print(f"Error: {str(e)}")
+            raise
+    
+    @web_app.get("/")
+    def root():
+        return {"service": "SeedVR2 Upscaler", "endpoint": "/generate"}
+    
+    return web_app
 
 
 @app.local_entrypoint()
