@@ -10,8 +10,15 @@ if [ -z "$1" ]; then
 fi
 
 VIDEO_URL="$1"
-OUTPUT_FILE="${2:-upscaled_result.mp4}"
 API_URL="https://aifnet--seedvr2-upscaler-fastapi-app.modal.run"
+
+# Generate unique output filename if not provided
+if [ -z "$2" ]; then
+    # Use first 8 chars of job ID (will be filled after job submission)
+    OUTPUT_FILE="upscaled_temp.mp4"
+else
+    OUTPUT_FILE="$2"
+fi
 
 echo "🚀 Submitting upscaling job..."
 
@@ -29,6 +36,14 @@ if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
 fi
 
 echo "✅ Job submitted: $JOB_ID"
+
+# Use first 8 chars of job ID for unique filename if no custom name provided
+if [ "$OUTPUT_FILE" = "upscaled_temp.mp4" ]; then
+    SHORT_ID=${JOB_ID:0:8}
+    OUTPUT_FILE="upscaled_${SHORT_ID}.mp4"
+fi
+
+echo "📁 Output will be saved to: $OUTPUT_FILE"
 echo ""
 
 # Poll status
@@ -37,7 +52,7 @@ while true; do
     STATE=$(echo $STATUS | jq -r '.status')
     ELAPSED=$(echo $STATUS | jq -r '.elapsed_seconds')
     PROGRESS=$(echo $STATUS | jq -r '.progress')
-    
+
     if [ "$STATE" = "completed" ]; then
         echo ""
         echo "✅ Job completed!"
@@ -45,10 +60,10 @@ while true; do
         OUTPUT_SIZE=$(echo $STATUS | jq -r '.output_size_mb')
         echo "📊 Output: ${OUTPUT_SIZE} MB"
         echo ""
-        
+
         echo "📥 Downloading..."
         curl -s "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
-        
+
         if [ -f "$OUTPUT_FILE" ]; then
             FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
             echo "✅ Saved to: $OUTPUT_FILE ($FILE_SIZE)"
@@ -58,17 +73,17 @@ while true; do
             exit 1
         fi
         break
-        
+
     elif [ "$STATE" = "failed" ]; then
         ERROR=$(echo $STATUS | jq -r '.error')
         echo "❌ Job failed: $ERROR"
         exit 1
-        
+
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
         printf "\r⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
     fi
-    
+
     sleep 5
 done
