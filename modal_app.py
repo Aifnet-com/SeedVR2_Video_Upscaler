@@ -39,9 +39,10 @@ volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="H100",  # or "A100-80GB", "H100" for more VRAM
-    timeout=1000,  # 1 hour max
+    gpu="H100",
+    timeout=1200,
     volumes={"/models": volume},
+    max_containers=10
 )
 def upscale_video(
     video_url: str,
@@ -67,10 +68,7 @@ def upscale_video(
     import tempfile
     import os
     import requests
-    import sys
-    
-    # Add workspace to path for imports
-    sys.path.insert(0, "/root")
+    import shutil
     
     print(f"🚀 Starting SeedVR2 upscaling")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}")
@@ -78,79 +76,80 @@ def upscale_video(
     # Set CUDA environment
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
     
-    # Copy inference_cli.py content inline since we can't mount files
-    # We'll need to fetch it from GitHub
-    inference_script = """
-# This will be replaced with actual inference_cli.py content
-# For now, we'll download it at runtime
-"""
+    # Create unique temp directory for this job (fixes concurrent clone conflicts)
+    repo_dir = tempfile.mkdtemp(prefix="seedvr_")
+    print(f"📁 Cloning repo to: {repo_dir}")
     
-    # Download inference_cli.py from your GitHub repo
-    cli_url = "https://raw.githubusercontent.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler/main/inference_cli.py"
-    response = requests.get(cli_url)
-    with open("/root/inference_cli.py", "w") as f:
-        f.write(response.text)
+    try:
+        # Clone the repo to unique directory
+        subprocess.run(
+            ["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", repo_dir],
+            check=True,
+            capture_output=True
+        )
+        
+        os.chdir(repo_dir)
+        
+        # Download input video
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = os.path.join(tmpdir, "input.mp4")
+            output_path = os.path.join(tmpdir, "output.mp4")
+            
+            print(f"📥 Downloading video from {video_url}")
+            response = requests.get(video_url, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            with open(input_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+            print(f"📦 Input video size: {input_size_mb:.2f} MB")
+            
+            # Run inference
+            cmd = [
+                "python", "inference_cli.py",
+                "--video_path", input_path,
+                "--batch_size", str(batch_size),
+                "--temporal_overlap", str(temporal_overlap),
+                "--stitch_mode", stitch_mode,
+                "--model", model,
+                "--model_dir", "/models",
+                "--output", output_path,
+                "--debug"
+            ]
+            
+            print(f"🔧 Running upscaler...")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_dir)
+            
+            if result.returncode != 0:
+                print(f"❌ Error: {result.stderr}")
+                raise Exception(f"Upscaling failed: {result.stderr}")
+            
+            print(result.stdout)
+            
+            if not os.path.exists(output_path):
+                raise Exception("Output file not created")
+            
+            output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"✅ Output video size: {output_size_mb:.2f} MB")
+            
+            # Read output file
+            with open(output_path, 'rb') as f:
+                output_data = f.read()
+            
+            return {
+                "video": output_data,
+                "logs": result.stdout,
+                "input_size_mb": input_size_mb,
+                "output_size_mb": output_size_mb
+            }
     
-    # Also download src directory files (we need the whole repo)
-    # Clone the repo instead
-    subprocess.run(["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", "/root/repo"], check=True)
-    os.chdir("/root/repo")
-    
-    # Download input video
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.mp4")
-        output_path = os.path.join(tmpdir, "output.mp4")
-        
-        print(f"📥 Downloading video from {video_url}")
-        response = requests.get(video_url, stream=True, timeout=300)
-        response.raise_for_status()
-        
-        with open(input_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        print(f"📦 Input video size: {input_size_mb:.2f} MB")
-        
-        # Run inference
-        cmd = [
-            "python", "inference_cli.py",
-            "--video_path", input_path,
-            "--batch_size", str(batch_size),
-            "--temporal_overlap", str(temporal_overlap),
-            "--stitch_mode", stitch_mode,
-            "--model", model,
-            "--model_dir", "/models",
-            "--output", output_path,
-            "--debug"
-        ]
-        
-        print(f"🔧 Running: {' '.join(cmd)}")
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd="/root/repo")
-        
-        if result.returncode != 0:
-            print(f"❌ Error: {result.stderr}")
-            raise Exception(f"Upscaling failed: {result.stderr}")
-        
-        print(result.stdout)
-        
-        if not os.path.exists(output_path):
-            raise Exception("Output file not created")
-        
-        output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"✅ Output video size: {output_size_mb:.2f} MB")
-        
-        # Read output file
-        with open(output_path, 'rb') as f:
-            output_data = f.read()
-        
-        return {
-            "video": output_data,
-            "logs": result.stdout,
-            "input_size_mb": input_size_mb,
-            "output_size_mb": output_size_mb
-        }
+    finally:
+        # Clean up repo directory
+        os.chdir("/root")
+        shutil.rmtree(repo_dir, ignore_errors=True)
 
 
 @app.local_entrypoint()
