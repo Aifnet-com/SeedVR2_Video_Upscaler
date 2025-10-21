@@ -296,7 +296,7 @@ def fastapi_app():
                 save_job(job_id, job_data)
     
     @web_app.post("/upscale", response_model=JobResponse)
-    async def upscale_endpoint(request: UpscaleRequest, background_tasks: BackgroundTasks):
+    async def upscale_endpoint(request: UpscaleRequest):
         """Submit a video upscaling job (returns immediately with job ID)"""
         if not request.video_url and not request.video_base64:
             raise HTTPException(status_code=400, detail="Must provide either video_url or video_base64")
@@ -311,7 +311,9 @@ def fastapi_app():
         }
         save_job(job_id, job_data)
         
-        background_tasks.add_task(process_video, job_id, request)
+        # Spawn concurrently using Modal's spawn, not FastAPI's background tasks
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
         
         return {
             "job_id": job_id,
