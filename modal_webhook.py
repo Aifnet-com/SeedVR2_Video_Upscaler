@@ -1,10 +1,12 @@
 """
 Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
+Supports both URL and local file inputs
 """
 
 import modal
 from typing import Dict, Optional
 import json
+from base64 import b64decode
 
 # Create Modal app
 app = modal.App("seedvr2-upscaler")
@@ -50,16 +52,17 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
         "/outputs": output_volume
     },
     scaledown_window=300,
-    max_containers=3,
+    max_containers=10,
 )
 def upscale_video(
-    video_url: str,
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
     batch_size: int = 100,
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors"
 ):
-    """Upscale a video using SeedVR2"""
+    """Upscale a video using SeedVR2 from URL or base64 data"""
     import subprocess
     import tempfile
     import os
@@ -94,13 +97,26 @@ def upscale_video(
         input_path = os.path.join(tmpdir, "input.mp4")
         temp_output_path = os.path.join(tmpdir, "output.mp4")
         
-        print(f"📥 Downloading video from {video_url}")
-        response = requests.get(video_url, stream=True, timeout=300)
-        response.raise_for_status()
-        
-        with open(input_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        # Download or decode video
+        if video_url:
+            print(f"📥 Downloading video from URL: {video_url}")
+            response = requests.get(video_url, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            with open(input_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Use URL for filename hash
+            url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
+        elif video_base64:
+            print(f"📥 Decoding video from base64")
+            video_bytes = b64decode(video_base64)
+            with open(input_path, 'wb') as f:
+                f.write(video_bytes)
+            url_hash = hashlib.md5(video_base64.encode()).hexdigest()[:8]
+        else:
+            raise Exception("Must provide either video_url or video_base64")
         
         input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
         print(f"📦 Input video size: {input_size_mb:.2f} MB")
@@ -117,7 +133,7 @@ def upscale_video(
             "--debug"
         ]
         
-        print(f"🔧 Running: {' '.join(cmd)}")
+        print(f"🔧 Running upscaler...")
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_dir)
         
         if result.returncode != 0:
@@ -134,7 +150,6 @@ def upscale_video(
         
         # Generate unique filename
         timestamp = int(time_module.time())
-        url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
         filename = f"upscaled_{timestamp}_{url_hash}.mp4"
         
         # Copy to shared persistent storage
@@ -205,7 +220,8 @@ def fastapi_app():
             return json.load(f)
     
     class UpscaleRequest(BaseModel):
-        video_url: str
+        video_url: Optional[str] = None
+        video_base64: Optional[str] = None
         batch_size: int = 100
         temporal_overlap: int = 12
         stitch_mode: str = "crossfade"
@@ -238,6 +254,7 @@ def fastapi_app():
             print(f"[Job {job_id}] Starting upscale_video.remote()")
             result = upscale_video.remote(
                 video_url=request.video_url,
+                video_base64=request.video_base64,
                 batch_size=request.batch_size,
                 temporal_overlap=request.temporal_overlap,
                 stitch_mode=request.stitch_mode,
@@ -281,6 +298,9 @@ def fastapi_app():
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest, background_tasks: BackgroundTasks):
         """Submit a video upscaling job (returns immediately with job ID)"""
+        if not request.video_url and not request.video_base64:
+            raise HTTPException(status_code=400, detail="Must provide either video_url or video_base64")
+        
         job_id = str(uuid.uuid4())
         
         job_data = {
@@ -353,7 +373,7 @@ def fastapi_app():
         
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.1 (Async Job Queue)",
+            "version": "2.2 (URL + Local File Support)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
