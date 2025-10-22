@@ -59,17 +59,17 @@ echo ""
 while true; do
     STATUS=$(curl -s "$API_URL/status/$JOB_ID")
     STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
-    
+
     # Handle initial sync delay (404s)
     if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
         printf "\r⏳ Waiting for job to be registered..."
         sleep 2
         continue
     fi
-    
+
     ELAPSED=$(echo $STATUS | jq -r '.elapsed_seconds')
     PROGRESS=$(echo $STATUS | jq -r '.progress')
-    
+
     if [ "$STATE" = "completed" ]; then
         echo ""
         echo "✅ Job completed!"
@@ -77,10 +77,10 @@ while true; do
         OUTPUT_SIZE=$(echo $STATUS | jq -r '.output_size_mb')
         echo "📊 Output: ${OUTPUT_SIZE} MB"
         echo ""
-        
+
         echo "📥 Downloading..."
         curl -s "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
-        
+
         if [ -f "$OUTPUT_FILE" ]; then
             FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
             echo "✅ Saved to: $OUTPUT_FILE ($FILE_SIZE)"
@@ -90,17 +90,17 @@ while true; do
             exit 1
         fi
         break
-        
+
     elif [ "$STATE" = "failed" ]; then
         ERROR=$(echo $STATUS | jq -r '.error')
         echo "❌ Job failed: $ERROR"
         exit 1
-        
+
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
         printf "\r⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
     fi
-    
+
     sleep 5
 done
