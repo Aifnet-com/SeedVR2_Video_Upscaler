@@ -54,13 +54,69 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     scaledown_window=300,
     max_containers=10,
 )
+def calculate_resolution(video_path: str, resolution_target: str) -> int:
+    """Calculate target resolution based on video dimensions and target preset"""
+    import cv2
+    import math
+    
+    # Target pixel counts for each resolution
+    target_pixels_map = {
+        "720p": 921600,      # 1280x720
+        "1080p": 2073600,    # 1920x1080
+    }
+    
+    target_pixels = target_pixels_map.get(resolution_target, 2073600)  # Default to 1080p
+    
+    # Get video dimensions
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    
+    # Calculate scaling ratio based on target pixel count
+    ratio = math.sqrt(target_pixels / (width * height))
+    new_width = round(width * ratio)
+    new_height = round(height * ratio)
+    
+    # Ensure multiple of 16
+    min_side = min(new_width, new_height)
+    if min_side % 16 != 0:
+        adjusted_min = math.ceil(min_side / 16) * 16
+        scale = adjusted_min / min_side
+        new_width = round(new_width * scale)
+        new_height = round(new_height * scale)
+    
+    # Clamp by maximum total pixels (4k with 1% margin)
+    max_pixels = int(8294400 * 0.99)
+    current_pixels = new_width * new_height
+    if current_pixels > max_pixels:
+        scale = math.sqrt(max_pixels / current_pixels)
+        new_width = round(new_width * scale)
+        new_height = round(new_height * scale)
+    
+    # Use the short side as the resolution parameter
+    return min(new_width, new_height)
+
+
+@app.function(
+    image=image,
+    gpu="H100",
+    timeout=1200,
+    volumes={
+        "/models": model_volume,
+        "/outputs": output_volume
+    },
+    scaledown_window=300,
+    max_containers=10,
+)
 def upscale_video(
     video_url: Optional[str] = None,
     video_base64: Optional[str] = None,
     batch_size: int = 100,
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
-    model: str = "seedvr2_ema_7b_fp16.safetensors"
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    resolution: str = "1080p"
 ):
     """Upscale a video using SeedVR2 from URL or base64 data"""
     import subprocess
@@ -121,6 +177,11 @@ def upscale_video(
         input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
         print(f"📦 Input video size: {input_size_mb:.2f} MB")
         
+        # Calculate target resolution based on input video dimensions
+        print(f"📐 Calculating resolution for target: {resolution}")
+        target_resolution = calculate_resolution.remote(input_path, resolution)
+        print(f"📐 Target resolution: {target_resolution}px (short side)")
+        
         cmd = [
             "python", "inference_cli.py",
             "--video_path", input_path,
@@ -128,6 +189,7 @@ def upscale_video(
             "--temporal_overlap", str(temporal_overlap),
             "--stitch_mode", stitch_mode,
             "--model", model,
+            "--resolution", str(target_resolution),
             "--model_dir", "/models",
             "--output", temp_output_path,
             "--debug"
@@ -226,6 +288,7 @@ def fastapi_app():
         temporal_overlap: int = 12
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
+        resolution: str = "1080p"
     
     class JobResponse(BaseModel):
         job_id: str
@@ -258,7 +321,8 @@ def fastapi_app():
                 batch_size=request.batch_size,
                 temporal_overlap=request.temporal_overlap,
                 stitch_mode=request.stitch_mode,
-                model=request.model
+                model=request.model,
+                resolution=request.resolution
             )
             
             filename = result["filename"]

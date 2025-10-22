@@ -1,58 +1,75 @@
 #!/bin/bash
 
-# SeedVR2 Video Upscaler - Complete workflow in one command
-# Usage: ./upscale.sh "https://example.com/video.mp4" [output.mp4]
+# SeedVR2 Video Upscaler - Simple CLI wrapper
+# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 1920]
 
 if [ -z "$1" ]; then
-    echo "Usage: $0 <video_url> [output_filename]"
-    echo "Example: $0 'https://astra.app/api/files/xxx.mp4' output.mp4"
+    echo "Usage: $0 <video_url> [--resolution 720p|1080p]"
+    echo "Example: $0 'https://astra.app/api/files/xxx.mp4'"
+    echo "Example: $0 'https://astra.app/api/files/xxx.mp4' --resolution 720p"
     exit 1
 fi
 
 VIDEO_URL="$1"
 API_URL="https://aifnet--seedvr2-upscaler-fastapi-app.modal.run"
+RESOLUTION="1080p"
 
-# Generate unique output filename if not provided
-if [ -z "$2" ]; then
-    # Use first 8 chars of job ID (will be filled after job submission)
-    OUTPUT_FILE="upscaled_temp.mp4"
-else
-    OUTPUT_FILE="$2"
+# Parse optional resolution argument
+if [ "$2" = "--resolution" ] && [ -n "$3" ]; then
+    if [[ "$3" =~ ^(720p|1080p)$ ]]; then
+        RESOLUTION=$3
+    else
+        echo "❌ Invalid resolution: $3. Must be 720p or 1080p"
+        exit 1
+    fi
 fi
 
 echo "🚀 Submitting upscaling job..."
 
 # Submit job
+REQUEST_BODY=$(cat <<EOF
+{
+  "video_url": "$VIDEO_URL",
+  "resolution": $RESOLUTION
+}
+EOF
+)
+
 RESPONSE=$(curl -s -X POST "$API_URL/upscale" \
   -H "Content-Type: application/json" \
-  -d "{\"video_url\": \"$VIDEO_URL\"}")
+  -d "$REQUEST_BODY")
 
-JOB_ID=$(echo $RESPONSE | jq -r '.job_id')
+JOB_ID=$(echo $RESPONSE | jq -r '.job_id' 2>/dev/null)
 
 if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
     echo "❌ Failed to submit job"
-    echo $RESPONSE | jq
+    echo $RESPONSE | jq 2>/dev/null || echo $RESPONSE
     exit 1
 fi
 
 echo "✅ Job submitted: $JOB_ID"
 
-# Use first 8 chars of job ID for unique filename if no custom name provided
-if [ "$OUTPUT_FILE" = "upscaled_temp.mp4" ]; then
-    SHORT_ID=${JOB_ID:0:8}
-    OUTPUT_FILE="upscaled_${SHORT_ID}.mp4"
-fi
-
+# Generate output filename
+SHORT_ID=${JOB_ID:0:8}
+OUTPUT_FILE="upscaled_${SHORT_ID}.mp4"
 echo "📁 Output will be saved to: $OUTPUT_FILE"
 echo ""
 
 # Poll status
 while true; do
     STATUS=$(curl -s "$API_URL/status/$JOB_ID")
-    STATE=$(echo $STATUS | jq -r '.status')
+    STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
+    
+    # Handle initial sync delay (404s)
+    if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
+        printf "\r⏳ Waiting for job to be registered..."
+        sleep 2
+        continue
+    fi
+    
     ELAPSED=$(echo $STATUS | jq -r '.elapsed_seconds')
     PROGRESS=$(echo $STATUS | jq -r '.progress')
-
+    
     if [ "$STATE" = "completed" ]; then
         echo ""
         echo "✅ Job completed!"
@@ -60,10 +77,10 @@ while true; do
         OUTPUT_SIZE=$(echo $STATUS | jq -r '.output_size_mb')
         echo "📊 Output: ${OUTPUT_SIZE} MB"
         echo ""
-
+        
         echo "📥 Downloading..."
         curl -s "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
-
+        
         if [ -f "$OUTPUT_FILE" ]; then
             FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
             echo "✅ Saved to: $OUTPUT_FILE ($FILE_SIZE)"
@@ -73,17 +90,17 @@ while true; do
             exit 1
         fi
         break
-
+        
     elif [ "$STATE" = "failed" ]; then
         ERROR=$(echo $STATUS | jq -r '.error')
         echo "❌ Job failed: $ERROR"
         exit 1
-
+        
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
         printf "\r⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
     fi
-
+    
     sleep 5
 done
