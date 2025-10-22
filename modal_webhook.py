@@ -237,84 +237,6 @@ def upscale_video(
     image=image,
     volumes={"/outputs": output_volume},
     timeout=3600,
-)
-def process_video_task(job_id: str, video_url: Optional[str], video_base64: Optional[str], batch_size: int, temporal_overlap: int, stitch_mode: str, model: str, resolution: str, output_volume_ref):
-    """Background task to process video - runs as separate Modal function"""
-    import json
-    import time
-    
-    JOBS_DIR = "/outputs/jobs"
-    
-    def load_job(job_id: str) -> Optional[dict]:
-        """Load job from persistent storage"""
-        job_file = f"{JOBS_DIR}/{job_id}.json"
-        if not os.path.exists(job_file):
-            return None
-        with open(job_file, "r") as f:
-            return json.load(f)
-    
-    def save_job(job_id: str, job_data: dict):
-        """Save job to persistent storage"""
-        with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
-            json.dump(job_data, f)
-        output_volume_ref.commit()
-    
-    try:
-        job_data = load_job(job_id)
-        job_data["status"] = "processing"
-        job_data["progress"] = "Upscaling in progress..."
-        save_job(job_id, job_data)
-        
-        print(f"[Job {job_id}] Starting upscale_video.remote()")
-        result = upscale_video.remote(
-            video_url=video_url,
-            video_base64=video_base64,
-            batch_size=batch_size,
-            temporal_overlap=temporal_overlap,
-            stitch_mode=stitch_mode,
-            model=model,
-            resolution=resolution
-        )
-        
-        filename = result["filename"]
-        print(f"[Job {job_id}] Upscale completed: {filename}")
-        
-        # Verify file exists
-        final_path = f"/outputs/{filename}"
-        output_volume_ref.reload()
-        
-        if not os.path.exists(final_path):
-            raise Exception(f"Output file not found: {final_path}")
-        
-        download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
-        
-        job_data.update({
-            "status": "completed",
-            "download_url": download_url,
-            "filename": filename,
-            "input_size_mb": result["input_size_mb"],
-            "output_size_mb": result["output_size_mb"],
-            "progress": "Completed successfully!"
-        })
-        save_job(job_id, job_data)
-        print(f"[Job {job_id}] Status saved")
-        
-    except Exception as e:
-        print(f"[Job {job_id}] Error: {str(e)}")
-        job_data = load_job(job_id)
-        if job_data:
-            job_data.update({
-                "status": "failed",
-                "error": str(e),
-                "progress": f"Failed: {str(e)}"
-            })
-            save_job(job_id, job_data)
-
-
-@app.function(
-    image=image,
-    volumes={"/outputs": output_volume},
-    timeout=3600,
     scaledown_window=60,
 )
 @modal.asgi_app()
@@ -325,6 +247,7 @@ def fastapi_app():
     import time
     import uuid
     import os
+    import asyncio
     
     web_app = FastAPI()
     
@@ -371,6 +294,59 @@ def fastapi_app():
         error: Optional[str] = None
         elapsed_seconds: Optional[float] = None
     
+    def process_video(job_id: str, request):
+        """Background task to process video"""
+        try:
+            job_data = load_job(job_id)
+            job_data["status"] = "processing"
+            job_data["progress"] = "Upscaling in progress..."
+            save_job(job_id, job_data)
+            
+            print(f"[Job {job_id}] Starting upscale_video.remote()")
+            result = upscale_video.remote(
+                video_url=request.video_url,
+                video_base64=request.video_base64,
+                batch_size=request.batch_size,
+                temporal_overlap=request.temporal_overlap,
+                stitch_mode=request.stitch_mode,
+                model=request.model,
+                resolution=request.resolution
+            )
+            
+            filename = result["filename"]
+            print(f"[Job {job_id}] Upscale completed: {filename}")
+            
+            # Verify file exists
+            final_path = f"/outputs/{filename}"
+            output_volume.reload()
+            
+            if not os.path.exists(final_path):
+                raise Exception(f"Output file not found: {final_path}")
+            
+            download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
+            
+            job_data.update({
+                "status": "completed",
+                "download_url": download_url,
+                "filename": filename,
+                "input_size_mb": result["input_size_mb"],
+                "output_size_mb": result["output_size_mb"],
+                "progress": "Completed successfully!"
+            })
+            save_job(job_id, job_data)
+            print(f"[Job {job_id}] Status saved")
+            
+        except Exception as e:
+            print(f"[Job {job_id}] Error: {str(e)}")
+            job_data = load_job(job_id)
+            if job_data:
+                job_data.update({
+                    "status": "failed",
+                    "error": str(e),
+                    "progress": f"Failed: {str(e)}"
+                })
+                save_job(job_id, job_data)
+    
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest):
         """Submit a video upscaling job (returns immediately with job ID)"""
@@ -387,18 +363,8 @@ def fastapi_app():
         }
         save_job(job_id, job_data)
         
-        # Spawn as separate Modal function for proper function reference resolution
-        process_video_task.spawn(
-            job_id=job_id,
-            video_url=request.video_url,
-            video_base64=request.video_base64,
-            batch_size=request.batch_size,
-            temporal_overlap=request.temporal_overlap,
-            stitch_mode=request.stitch_mode,
-            model=request.model,
-            resolution=request.resolution,
-            output_volume_ref=output_volume
-        )
+        # Spawn in background thread
+        asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
         
         return {
             "job_id": job_id,
