@@ -201,13 +201,12 @@ def upscale_video(
 )
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
     from fastapi.responses import FileResponse
     from pydantic import BaseModel
     import time
     import uuid
     import os
-    import asyncio
 
     web_app = FastAPI()
 
@@ -254,14 +253,29 @@ def fastapi_app():
         error: Optional[str] = None
         elapsed_seconds: Optional[float] = None
 
-    async def monitor_job(job_id: str, call):
-        """Monitor a Modal function call and update job status"""
+    def process_video(job_id: str, request: UpscaleRequest):
+        """Background task to process video"""
         try:
-            result = await call.get_async()
+            job_data = load_job(job_id)
+            job_data["status"] = "processing"
+            job_data["progress"] = "Upscaling in progress..."
+            save_job(job_id, job_data)
+
+            print(f"[Job {job_id}] Starting upscale_video.remote()")
+            result = upscale_video.remote(
+                video_url=request.video_url,
+                video_base64=request.video_base64,
+                batch_size=request.batch_size,
+                temporal_overlap=request.temporal_overlap,
+                stitch_mode=request.stitch_mode,
+                model=request.model,
+                resolution=request.resolution
+            )
 
             filename = result["filename"]
             print(f"[Job {job_id}] Upscale completed: {filename}")
 
+            # Verify file exists
             final_path = f"/outputs/{filename}"
             output_volume.reload()
 
@@ -270,17 +284,15 @@ def fastapi_app():
 
             download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
 
-            job_data = load_job(job_id)
-            if job_data:
-                job_data.update({
-                    "status": "completed",
-                    "download_url": download_url,
-                    "filename": filename,
-                    "input_size_mb": result["input_size_mb"],
-                    "output_size_mb": result["output_size_mb"],
-                    "progress": "Completed successfully!"
-                })
-                save_job(job_id, job_data)
+            job_data.update({
+                "status": "completed",
+                "download_url": download_url,
+                "filename": filename,
+                "input_size_mb": result["input_size_mb"],
+                "output_size_mb": result["output_size_mb"],
+                "progress": "Completed successfully!"
+            })
+            save_job(job_id, job_data)
             print(f"[Job {job_id}] Status saved")
 
         except Exception as e:
@@ -310,26 +322,13 @@ def fastapi_app():
         }
         save_job(job_id, job_data)
 
-        job_data["status"] = "processing"
-        job_data["progress"] = "Upscaling in progress..."
-        save_job(job_id, job_data)
-
-        print(f"[Job {job_id}] Spawning upscale_video.spawn()")
-        call = upscale_video.spawn(
-            video_url=request.video_url,
-            video_base64=request.video_base64,
-            batch_size=request.batch_size,
-            temporal_overlap=request.temporal_overlap,
-            stitch_mode=request.stitch_mode,
-            model=request.model,
-            resolution=request.resolution
-        )
-
-        asyncio.create_task(monitor_job(job_id, call))
+        # Spawn concurrently using Modal's spawn, not FastAPI's background tasks
+        import asyncio
+        asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
 
         return {
             "job_id": job_id,
-            "status": "processing",
+            "status": "pending",
             "message": f"Job submitted. Check status: GET /status/{job_id}"
         }
 
@@ -340,6 +339,7 @@ def fastapi_app():
         if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
 
+        # Calculate elapsed time
         created_at = job_data.get("created_at")
         elapsed_seconds = None
         if created_at:
@@ -386,7 +386,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.4 (Async Concurrency Fix)",
+            "version": "2.3 (Resolution Support)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
