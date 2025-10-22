@@ -61,7 +61,7 @@ def upscale_video(
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
-    resolution: int = 1080
+    resolution: str = "1080p"
 ):
     """Upscale a video using SeedVR2 from URL or base64 data"""
     import subprocess
@@ -72,8 +72,15 @@ def upscale_video(
     import time as time_module
     import shutil
 
+    # Convert resolution string to pixel value
+    resolution_map = {
+        "720p": 720,
+        "1080p": 1080
+    }
+    resolution_px = resolution_map.get(resolution, 1080)
+
     print(f"🚀 Starting SeedVR2 upscaling")
-    print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, resolution={resolution}px")
+    print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, resolution={resolution_px}px")
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
@@ -129,7 +136,7 @@ def upscale_video(
             "--temporal_overlap", str(temporal_overlap),
             "--stitch_mode", stitch_mode,
             "--model", model,
-            "--resolution", str(resolution),
+            "--resolution", str(resolution_px),
             "--model_dir", "/models",
             "--output", temp_output_path,
             "--debug"
@@ -229,7 +236,7 @@ def fastapi_app():
         temporal_overlap: int = 12
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
-        resolution: int = 1080
+        resolution: str = "1080p"
 
     class JobResponse(BaseModel):
         job_id: str

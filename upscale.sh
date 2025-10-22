@@ -12,31 +12,25 @@ fi
 
 VIDEO_URL="$1"
 API_URL="https://aifnet--seedvr2-upscaler-fastapi-app.modal.run"
-RESOLUTION=1080
+RESOLUTION="1080p"
 
 # Parse optional resolution argument
 if [ "$2" = "--resolution" ] && [ -n "$3" ]; then
-    case "$3" in
-        720p)
-            RESOLUTION=720
-            ;;
-        1080p)
-            RESOLUTION=1080
-            ;;
-        *)
-            echo "❌ Invalid resolution: $3. Must be 720p or 1080p"
-            exit 1
-            ;;
-    esac
+    if [[ "$3" =~ ^(720p|1080p)$ ]]; then
+        RESOLUTION="$3"
+    else
+        echo "❌ Invalid resolution: $3. Must be 720p or 1080p"
+        exit 1
+    fi
 fi
 
 echo "🚀 Submitting upscaling job..."
 
-# Submit job with resolution as integer
+# Submit job with resolution as string
 REQUEST_BODY=$(cat <<EOF
 {
   "video_url": "$VIDEO_URL",
-  "resolution": $RESOLUTION
+  "resolution": "$RESOLUTION"
 }
 EOF
 )
