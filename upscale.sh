@@ -30,7 +30,7 @@ echo "🚀 Submitting upscaling job..."
 REQUEST_BODY=$(cat <<EOF
 {
   "video_url": "$VIDEO_URL",
-  "resolution": $RESOLUTION
+  "resolution": "$RESOLUTION"
 }
 EOF
 )
