@@ -54,61 +54,6 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     scaledown_window=300,
     max_containers=10,
 )
-def calculate_resolution(video_path: str, resolution_target: str) -> int:
-    """Calculate target resolution based on video dimensions and target preset"""
-    import cv2
-    import math
-    
-    # Target pixel counts for each resolution
-    target_pixels_map = {
-        "720p": 921600,      # 1280x720
-        "1080p": 2073600,    # 1920x1080
-    }
-    
-    target_pixels = target_pixels_map.get(resolution_target, 2073600)  # Default to 1080p
-    
-    # Get video dimensions
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    
-    # Calculate scaling ratio based on target pixel count
-    ratio = math.sqrt(target_pixels / (width * height))
-    new_width = round(width * ratio)
-    new_height = round(height * ratio)
-    
-    # Ensure multiple of 16
-    min_side = min(new_width, new_height)
-    if min_side % 16 != 0:
-        adjusted_min = math.ceil(min_side / 16) * 16
-        scale = adjusted_min / min_side
-        new_width = round(new_width * scale)
-        new_height = round(new_height * scale)
-    
-    # Clamp by maximum total pixels (4k with 1% margin)
-    max_pixels = int(8294400 * 0.99)
-    current_pixels = new_width * new_height
-    if current_pixels > max_pixels:
-        scale = math.sqrt(max_pixels / current_pixels)
-        new_width = round(new_width * scale)
-        new_height = round(new_height * scale)
-    
-    # Use the short side as the resolution parameter
-    return min(new_width, new_height)
-
-
-@app.function(
-    image=image,
-    gpu="H100",
-    timeout=1200,
-    volumes={
-        "/models": model_volume,
-        "/outputs": output_volume
-    },
-    scaledown_window=300,
-    max_containers=10,
-)
 def upscale_video(
     video_url: Optional[str] = None,
     video_base64: Optional[str] = None,
@@ -126,6 +71,8 @@ def upscale_video(
     import hashlib
     import time as time_module
     import shutil
+    import cv2
+    import math
     
     print(f"🚀 Starting SeedVR2 upscaling")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}")
@@ -179,8 +126,48 @@ def upscale_video(
         
         # Calculate target resolution based on input video dimensions
         print(f"📐 Calculating resolution for target: {resolution}")
-        target_resolution = calculate_resolution.remote(input_path, resolution)
-        print(f"📐 Target resolution: {target_resolution}px (short side)")
+        
+        target_pixels_map = {
+            "720p": 921600,      # 1280x720
+            "1080p": 2073600,    # 1920x1080
+        }
+        
+        target_pixels = target_pixels_map.get(resolution, 2073600)
+        
+        # Get video dimensions
+        cap = cv2.VideoCapture(input_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        
+        if width == 0 or height == 0:
+            raise Exception(f"Could not read video dimensions: {width}x{height}")
+        
+        print(f"📐 Input dimensions: {width}x{height}")
+        
+        # Calculate scaling ratio based on target pixel count
+        ratio = math.sqrt(target_pixels / (width * height))
+        new_width = round(width * ratio)
+        new_height = round(height * ratio)
+        
+        # Ensure multiple of 16
+        min_side = min(new_width, new_height)
+        if min_side % 16 != 0:
+            adjusted_min = math.ceil(min_side / 16) * 16
+            scale = adjusted_min / min_side
+            new_width = round(new_width * scale)
+            new_height = round(new_height * scale)
+        
+        # Clamp by maximum total pixels (4k with 1% margin)
+        max_pixels = int(8294400 * 0.99)
+        current_pixels = new_width * new_height
+        if current_pixels > max_pixels:
+            scale = math.sqrt(max_pixels / current_pixels)
+            new_width = round(new_width * scale)
+            new_height = round(new_height * scale)
+        
+        target_resolution = min(new_width, new_height)
+        print(f"📐 Target resolution: {target_resolution}px (short side) = {new_width}x{new_height}")
         
         cmd = [
             "python", "inference_cli.py",
