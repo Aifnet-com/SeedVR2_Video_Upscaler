@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SeedVR2 Video Upscaler - Simple CLI wrapper
-# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 1920]
+# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 720p|1080p]
 
 if [ -z "$1" ]; then
     echo "Usage: $0 <video_url> [--resolution 720p|1080p]"
@@ -12,25 +12,31 @@ fi
 
 VIDEO_URL="$1"
 API_URL="https://aifnet--seedvr2-upscaler-fastapi-app.modal.run"
-RESOLUTION="1080p"
+RESOLUTION=1080
 
 # Parse optional resolution argument
 if [ "$2" = "--resolution" ] && [ -n "$3" ]; then
-    if [[ "$3" =~ ^(720p|1080p)$ ]]; then
-        RESOLUTION=$3
-    else
-        echo "❌ Invalid resolution: $3. Must be 720p or 1080p"
-        exit 1
-    fi
+    case "$3" in
+        720p)
+            RESOLUTION=720
+            ;;
+        1080p)
+            RESOLUTION=1080
+            ;;
+        *)
+            echo "❌ Invalid resolution: $3. Must be 720p or 1080p"
+            exit 1
+            ;;
+    esac
 fi
 
 echo "🚀 Submitting upscaling job..."
 
-# Submit job
+# Submit job with resolution as integer
 REQUEST_BODY=$(cat <<EOF
 {
   "video_url": "$VIDEO_URL",
-  "resolution": "$RESOLUTION"
+  "resolution": $RESOLUTION
 }
 EOF
 )
