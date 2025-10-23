@@ -85,7 +85,7 @@ def upscale_video(
 
     try:
         subprocess.run(
-            ["git", "clone", "https://github.com/Aifnet-com/ComfyUI-SeedVR2_VideoUpscaler.git", repo_dir],
+            ["git", "clone", "https://github.com/Aifnet-com/SeedVR2_Video_Upscaler.git", repo_dir],
             check=True,
             capture_output=True,
             text=True
@@ -142,7 +142,7 @@ def upscale_video(
         }
 
         target_pixels = target_pixels_map.get(resolution, 2073600)
-        
+
         # Initial scale based on target pixel count
         ratio = math.sqrt(target_pixels / (width * height))
         new_width = round(width * ratio)
