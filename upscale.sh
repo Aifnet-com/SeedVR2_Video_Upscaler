@@ -100,7 +100,7 @@ while true; do
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
         printf "\r⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
-    fi
+    fi 
 
     sleep 5
 done
