@@ -71,16 +71,11 @@ def upscale_video(
     import hashlib
     import time as time_module
     import shutil
-
-    # Convert resolution string to pixel value
-    resolution_map = {
-        "720p": 720,
-        "1080p": 1080
-    }
-    resolution_px = resolution_map.get(resolution, 1080)
+    import cv2
+    import math
 
     print(f"🚀 Starting SeedVR2 upscaling")
-    print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, resolution={resolution_px}px")
+    print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, target={resolution}")
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
@@ -90,7 +85,7 @@ def upscale_video(
 
     try:
         subprocess.run(
-            ["git", "clone", "https://github.com/gkirilov7/ComfyUI-SeedVR2_VideoUpscaler.git", repo_dir],
+            ["git", "clone", "https://github.com/Aifnet-com/ComfyUI-SeedVR2_VideoUpscaler.git", repo_dir],
             check=True,
             capture_output=True,
             text=True
@@ -128,6 +123,51 @@ def upscale_video(
 
         input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
         print(f"📦 Input video size: {input_size_mb:.2f} MB")
+
+        # Get video dimensions
+        cap = cv2.VideoCapture(input_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+
+        if width == 0 or height == 0:
+            raise Exception(f"Could not read video dimensions: {width}x{height}")
+
+        print(f"📐 Input dimensions: {width}x{height}")
+
+        # Calculate target resolution based on input dimensions
+        target_pixels_map = {
+            '720p': 921600,   # 1280x720
+            '1080p': 2073600, # 1920x1080
+        }
+
+        target_pixels = target_pixels_map.get(resolution, 2073600)
+        
+        # Initial scale based on target pixel count
+        ratio = math.sqrt(target_pixels / (width * height))
+        new_width = round(width * ratio)
+        new_height = round(height * ratio)
+
+        # Ensure multiple of 16
+        min_side = min(new_width, new_height)
+        if min_side % 16 != 0:
+            adjusted_min = math.ceil(min_side / 16) * 16
+            scale = adjusted_min / min_side
+            new_width = round(new_width * scale)
+            new_height = round(new_height * scale)
+
+        # Clamp by maximum total pixels (4k = 8294400) - 1% margin
+        max_pixels = int(8294400 * 0.99)
+        current_pixels = new_width * new_height
+        if current_pixels > max_pixels:
+            scale = math.sqrt(max_pixels / current_pixels)
+            new_width = round(new_width * scale)
+            new_height = round(new_height * scale)
+
+        # Use minimum side (short side) as resolution parameter
+        resolution_px = min(new_width, new_height)
+
+        print(f"📐 Calculated output: {new_width}x{new_height} (resolution={resolution_px}px)")
 
         cmd = [
             "python", "inference_cli.py",
@@ -201,12 +241,13 @@ def upscale_video(
 )
 @modal.asgi_app()
 def fastapi_app():
-    from fastapi import FastAPI, HTTPException, BackgroundTasks
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import FileResponse
     from pydantic import BaseModel
     import time
     import uuid
     import os
+    import asyncio
 
     web_app = FastAPI()
 
@@ -257,9 +298,10 @@ def fastapi_app():
         """Background task to process video"""
         try:
             job_data = load_job(job_id)
-            job_data["status"] = "processing"
-            job_data["progress"] = "Upscaling in progress..."
-            save_job(job_id, job_data)
+            if job_data:
+                job_data["status"] = "processing"
+                job_data["progress"] = "Upscaling in progress..."
+                save_job(job_id, job_data)
 
             print(f"[Job {job_id}] Starting upscale_video.remote()")
             result = upscale_video.remote(
@@ -284,15 +326,17 @@ def fastapi_app():
 
             download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
 
-            job_data.update({
-                "status": "completed",
-                "download_url": download_url,
-                "filename": filename,
-                "input_size_mb": result["input_size_mb"],
-                "output_size_mb": result["output_size_mb"],
-                "progress": "Completed successfully!"
-            })
-            save_job(job_id, job_data)
+            job_data = load_job(job_id)
+            if job_data:
+                job_data.update({
+                    "status": "completed",
+                    "download_url": download_url,
+                    "filename": filename,
+                    "input_size_mb": result["input_size_mb"],
+                    "output_size_mb": result["output_size_mb"],
+                    "progress": "Completed successfully!"
+                })
+                save_job(job_id, job_data)
             print(f"[Job {job_id}] Status saved")
 
         except Exception as e:
@@ -318,12 +362,11 @@ def fastapi_app():
             "job_id": job_id,
             "status": "pending",
             "created_at": time.time(),
-            "request": request.dict()
+            "request": request.model_dump()
         }
         save_job(job_id, job_data)
 
-        # Spawn concurrently using Modal's spawn, not FastAPI's background tasks
-        import asyncio
+        # Spawn in background thread
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
 
         return {
@@ -339,7 +382,6 @@ def fastapi_app():
         if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # Calculate elapsed time
         created_at = job_data.get("created_at")
         elapsed_seconds = None
         if created_at:
@@ -386,7 +428,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.3 (Resolution Support)",
+            "version": "2.4 (Smart Resolution Calculation)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
