@@ -46,7 +46,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 @app.function(
     image=image,
     gpu="H100",
-    timeout=1200,
+    timeout=7200,
     volumes={
         "/models": model_volume,
         "/outputs": output_volume
@@ -236,7 +236,7 @@ def upscale_video(
 @app.function(
     image=image,
     volumes={"/outputs": output_volume},
-    timeout=3600,
+    timeout=7200,
     scaledown_window=60,
 )
 @modal.asgi_app()
