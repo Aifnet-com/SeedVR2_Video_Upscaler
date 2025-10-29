@@ -45,7 +45,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200",
     timeout=7200,
     volumes={
         "/models": model_volume,
