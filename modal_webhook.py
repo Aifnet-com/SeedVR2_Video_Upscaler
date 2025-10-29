@@ -139,6 +139,8 @@ def upscale_video(
         target_pixels_map = {
             '720p': 921600,   # 1280x720
             '1080p': 2073600, # 1920x1080
+            '2k': 3686400,    # 2560x1440
+            '4k': 8294400,    # 3840x2160
         }
 
         target_pixels = target_pixels_map.get(resolution, 2073600)
@@ -428,7 +430,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.4 (Smart Resolution Calculation)",
+            "version": "2.5 (Added 2K and 4K resolution options)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",

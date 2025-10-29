@@ -4,9 +4,10 @@
 # Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 720p|1080p]
 
 if [ -z "$1" ]; then
-    echo "Usage: $0 <video_url> [--resolution 720p|1080p]"
+    echo "Usage: $0 <video_url> [--resolution 720p|1080p|2k|4k]"
     echo "Example: $0 'https://astra.app/api/files/xxx.mp4'"
     echo "Example: $0 'https://astra.app/api/files/xxx.mp4' --resolution 720p"
+    echo "Example: $0 'https://astra.app/api/files/xxx.mp4' --resolution 4k"
     exit 1
 fi
 
@@ -16,10 +17,10 @@ RESOLUTION="1080p"
 
 # Parse optional resolution argument
 if [ "$2" = "--resolution" ] && [ -n "$3" ]; then
-    if [[ "$3" =~ ^(720p|1080p)$ ]]; then
+    if [[ "$3" =~ ^(720p|1080p|2k|4k)$ ]]; then
         RESOLUTION="$3"
     else
-        echo "❌ Invalid resolution: $3. Must be 720p or 1080p"
+        echo "❌ Invalid resolution: $3. Must be 720p, 1080p, 2k, or 4k"
         exit 1
     fi
 fi
@@ -100,7 +101,7 @@ while true; do
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
         printf "\r⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
-    fi 
+    fi
 
     sleep 5
 done
