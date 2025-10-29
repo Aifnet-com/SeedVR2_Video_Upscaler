@@ -147,29 +147,19 @@ def upscale_video(
 
         # Initial scale based on target pixel count
         ratio = math.sqrt(target_pixels / (width * height))
-        new_width = round(width * ratio)
-        new_height = round(height * ratio)
+        new_width = width * ratio      # Keep as float for precision
+        new_height = height * ratio    # Keep as float for precision
 
-        # Ensure multiple of 16
-        min_side = min(new_width, new_height)
-        if min_side % 16 != 0:
-            adjusted_min = math.ceil(min_side / 16) * 16
-            scale = adjusted_min / min_side
-            new_width = round(new_width * scale)
-            new_height = round(new_height * scale)
-
-        # Clamp by maximum total pixels (4k = 8294400) - 1% margin
-        max_pixels = int(8294400 * 0.99)
-        current_pixels = new_width * new_height
-        if current_pixels > max_pixels:
-            scale = math.sqrt(max_pixels / current_pixels)
-            new_width = round(new_width * scale)
-            new_height = round(new_height * scale)
+        # Round BOTH dimensions to nearest multiple of 16
+        new_width = round(new_width / 16) * 16
+        new_height = round(new_height / 16) * 16
 
         # Use minimum side (short side) as resolution parameter
         resolution_px = min(new_width, new_height)
 
         print(f"📐 Calculated output: {new_width}x{new_height} (resolution={resolution_px}px)")
+        print(f"   Target pixels: {target_pixels:,}")
+        print(f"   Actual pixels: {new_width * new_height:,} ({((new_width * new_height / target_pixels - 1) * 100):+.1f}%)")
 
         cmd = [
             "python", "inference_cli.py",
@@ -430,7 +420,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "2.5 (Added 2K and 4K resolution options)",
+            "version": "3.0 (Fixed resolution + 2K/4K support)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
