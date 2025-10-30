@@ -57,7 +57,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 def upscale_video(
     video_url: Optional[str] = None,
     video_base64: Optional[str] = None,
-    batch_size: int = 100,
+    batch_size: int = 25,
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
@@ -264,7 +264,7 @@ def fastapi_app():
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
         video_base64: Optional[str] = None
-        batch_size: int = 100
+        batch_size: int = 25
         temporal_overlap: int = 12
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
