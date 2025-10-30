@@ -1,6 +1,6 @@
 """
 Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
-Supports both URL and local file inputs with REAL-TIME LOG STREAMING
+Supports both URL and local file inputs with REAL-TIME LOG STREAMING via Modal Dict
 """
 
 import modal
@@ -10,6 +10,9 @@ from base64 import b64decode
 
 # Create Modal app
 app = modal.App("seedvr2-upscaler")
+
+# Create a shared dict for real-time progress updates (in-memory, fast)
+progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
 
 # Define the container image with all dependencies
 image = (
@@ -100,16 +103,27 @@ def upscale_video_h200(
 
 
 def _update_job_progress(job_id: str, progress_text: str):
-    """Update job progress in persistent storage"""
+    """Update job progress in BOTH persistent storage AND in-memory dict for fast access"""
     if not job_id:
         return
 
     import os
+
+    # Update in-memory dict (FAST - for real-time status checks)
+    try:
+        progress_dict[job_id] = progress_text
+    except Exception as e:
+        print(f"⚠️  Failed to update progress dict: {e}")
+
+    # Also update persistent storage (slower but survives restarts)
     JOBS_DIR = "/outputs/jobs"
     job_file = f"{JOBS_DIR}/{job_id}.json"
 
     if os.path.exists(job_file):
         try:
+            # Reload volume to see latest changes
+            output_volume.reload()
+
             with open(job_file, "r") as f:
                 job_data = json.load(f)
 
@@ -120,7 +134,7 @@ def _update_job_progress(job_id: str, progress_text: str):
 
             output_volume.commit()
         except Exception as e:
-            print(f"⚠️  Failed to update progress: {e}")
+            print(f"⚠️  Failed to update progress file: {e}")
 
 
 def _upscale_video_impl(
@@ -374,6 +388,9 @@ def fastapi_app():
         """Load job from persistent storage"""
         job_file = f"{JOBS_DIR}/{job_id}.json"
         if not os.path.exists(job_file):
+            # Try reloading volume in case it was just created
+            output_volume.reload()
+        if not os.path.exists(job_file):
             return None
         with open(job_file, "r") as f:
             return json.load(f)
@@ -464,6 +481,14 @@ def fastapi_app():
                     "progress": "✅ Completed successfully!"
                 })
                 save_job(job_id, job_data)
+
+            # Clear from in-memory dict after completion
+            try:
+                if job_id in progress_dict:
+                    del progress_dict[job_id]
+            except:
+                pass
+
             print(f"[Job {job_id}] Status saved")
 
         except Exception as e:
@@ -476,6 +501,13 @@ def fastapi_app():
                     "progress": f"❌ Failed: {str(e)}"
                 })
                 save_job(job_id, job_data)
+
+            # Clear from in-memory dict after failure
+            try:
+                if job_id in progress_dict:
+                    del progress_dict[job_id]
+            except:
+                pass
 
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest):
@@ -509,10 +541,24 @@ def fastapi_app():
 
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
-        """Check the status of a job"""
+        """Check the status of a job - checks in-memory dict FIRST for real-time progress"""
+
+        # First check the fast in-memory dict for real-time progress
+        realtime_progress = None
+        try:
+            if job_id in progress_dict:
+                realtime_progress = progress_dict[job_id]
+        except:
+            pass
+
+        # Then load from persistent storage
         job_data = load_job(job_id)
         if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
+
+        # Use real-time progress if available, otherwise fall back to stored progress
+        if realtime_progress:
+            job_data["progress"] = realtime_progress
 
         created_at = job_data.get("created_at")
         elapsed_seconds = None
@@ -560,7 +606,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "3.2 (H100 for 720p/1080p, H200 for 2K/4K) - REAL-TIME LOGS",
+            "version": "3.3 (H100 for 720p/1080p, H200 for 2K/4K) - REAL-TIME LOGS via Modal Dict",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
