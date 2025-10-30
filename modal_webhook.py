@@ -45,6 +45,33 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 
 @app.function(
     image=image,
+    gpu="H100",
+    timeout=7200,
+    volumes={
+        "/models": model_volume,
+        "/outputs": output_volume
+    },
+    scaledown_window=300,
+    max_containers=10,
+)
+def upscale_video_h100(
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    batch_size: int = 100,
+    temporal_overlap: int = 12,
+    stitch_mode: str = "crossfade",
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    resolution: str = "1080p"
+):
+    """Upscale a video using SeedVR2 from URL or base64 data (H100 for 720p/1080p)"""
+    return _upscale_video_impl(
+        video_url, video_base64, batch_size, temporal_overlap,
+        stitch_mode, model, resolution, gpu_type="H100"
+    )
+
+
+@app.function(
+    image=image,
     gpu="H200",
     timeout=7200,
     volumes={
@@ -54,7 +81,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
     scaledown_window=300,
     max_containers=10,
 )
-def upscale_video(
+def upscale_video_h200(
     video_url: Optional[str] = None,
     video_base64: Optional[str] = None,
     batch_size: int = 100,
@@ -62,6 +89,23 @@ def upscale_video(
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p"
+):
+    """Upscale a video using SeedVR2 from URL or base64 data (H200 for 2K/4K)"""
+    return _upscale_video_impl(
+        video_url, video_base64, batch_size, temporal_overlap,
+        stitch_mode, model, resolution, gpu_type="H200"
+    )
+
+
+def _upscale_video_impl(
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    batch_size: int = 100,
+    temporal_overlap: int = 12,
+    stitch_mode: str = "crossfade",
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    resolution: str = "1080p",
+    gpu_type: str = "H100"
 ):
     """Upscale a video using SeedVR2 from URL or base64 data"""
     import subprocess
@@ -74,7 +118,7 @@ def upscale_video(
     import cv2
     import math
 
-    print(f"🚀 Starting SeedVR2 upscaling")
+    print(f"🚀 Starting SeedVR2 upscaling on {gpu_type}")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, target={resolution}")
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
@@ -274,6 +318,7 @@ def fastapi_app():
         job_id: str
         status: str
         message: str
+        gpu_type: str  # H100 or H200
 
     class JobStatus(BaseModel):
         job_id: str
@@ -296,15 +341,30 @@ def fastapi_app():
                 save_job(job_id, job_data)
 
             print(f"[Job {job_id}] Starting upscale_video.remote()")
-            result = upscale_video.remote(
-                video_url=request.video_url,
-                video_base64=request.video_base64,
-                batch_size=request.batch_size,
-                temporal_overlap=request.temporal_overlap,
-                stitch_mode=request.stitch_mode,
-                model=request.model,
-                resolution=request.resolution
-            )
+            
+            # Select GPU based on resolution
+            if request.resolution in ['720p', '1080p']:
+                print(f"[Job {job_id}] Using H100 for {request.resolution}")
+                result = upscale_video_h100.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution
+                )
+            else:  # 2k or 4k
+                print(f"[Job {job_id}] Using H200 for {request.resolution}")
+                result = upscale_video_h200.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution
+                )
 
             filename = result["filename"]
             print(f"[Job {job_id}] Upscale completed: {filename}")
@@ -349,11 +409,15 @@ def fastapi_app():
             raise HTTPException(status_code=400, detail="Must provide either video_url or video_base64")
 
         job_id = str(uuid.uuid4())
+        
+        # Determine GPU based on resolution
+        gpu_type = "H100" if request.resolution in ['720p', '1080p'] else "H200"
 
         job_data = {
             "job_id": job_id,
             "status": "pending",
             "created_at": time.time(),
+            "gpu_type": gpu_type,
             "request": request.model_dump()
         }
         save_job(job_id, job_data)
@@ -364,7 +428,8 @@ def fastapi_app():
         return {
             "job_id": job_id,
             "status": "pending",
-            "message": f"Job submitted. Check status: GET /status/{job_id}"
+            "message": f"Job submitted. Check status: GET /status/{job_id}",
+            "gpu_type": gpu_type
         }
 
     @web_app.get("/status/{job_id}", response_model=JobStatus)
@@ -420,7 +485,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "3.0 (Fixed resolution + 2K/4K support)",
+            "version": "3.1 (H100 for 720p/1080p, H200 for 2K/4K)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",

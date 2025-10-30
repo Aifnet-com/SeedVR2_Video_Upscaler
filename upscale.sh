@@ -50,6 +50,12 @@ fi
 
 echo "✅ Job submitted: $JOB_ID"
 
+# Extract and display GPU type
+GPU_TYPE=$(echo $RESPONSE | jq -r '.gpu_type' 2>/dev/null)
+if [ -n "$GPU_TYPE" ] && [ "$GPU_TYPE" != "null" ]; then
+    echo "🖥️  GPU: $GPU_TYPE"
+fi
+
 # Generate output filename
 SHORT_ID=${JOB_ID:0:8}
 OUTPUT_FILE="upscaled_${SHORT_ID}.mp4"
