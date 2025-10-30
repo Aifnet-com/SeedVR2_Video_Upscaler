@@ -1,6 +1,6 @@
 """
 Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
-Supports both URL and local file inputs
+Supports both URL and local file inputs with REAL-TIME LOG STREAMING
 """
 
 import modal
@@ -17,7 +17,7 @@ image = (
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
     .pip_install(
         "torch==2.5.1",
-        "torchvision==0.20.1", 
+        "torchvision==0.20.1",
         "torchaudio==2.5.1",
         index_url="https://download.pytorch.org/whl/cu121"
     )
@@ -61,12 +61,13 @@ def upscale_video_h100(
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
-    resolution: str = "1080p"
+    resolution: str = "1080p",
+    job_id: Optional[str] = None
 ):
     """Upscale a video using SeedVR2 from URL or base64 data (H100 for 720p/1080p)"""
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
-        stitch_mode, model, resolution, gpu_type="H100"
+        stitch_mode, model, resolution, gpu_type="H100", job_id=job_id
     )
 
 
@@ -88,13 +89,38 @@ def upscale_video_h200(
     temporal_overlap: int = 12,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
-    resolution: str = "1080p"
+    resolution: str = "1080p",
+    job_id: Optional[str] = None
 ):
     """Upscale a video using SeedVR2 from URL or base64 data (H200 for 2K/4K)"""
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
-        stitch_mode, model, resolution, gpu_type="H200"
+        stitch_mode, model, resolution, gpu_type="H200", job_id=job_id
     )
+
+
+def _update_job_progress(job_id: str, progress_text: str):
+    """Update job progress in persistent storage"""
+    if not job_id:
+        return
+
+    import os
+    JOBS_DIR = "/outputs/jobs"
+    job_file = f"{JOBS_DIR}/{job_id}.json"
+
+    if os.path.exists(job_file):
+        try:
+            with open(job_file, "r") as f:
+                job_data = json.load(f)
+
+            job_data["progress"] = progress_text
+
+            with open(job_file, "w") as f:
+                json.dump(job_data, f)
+
+            output_volume.commit()
+        except Exception as e:
+            print(f"⚠️  Failed to update progress: {e}")
 
 
 def _upscale_video_impl(
@@ -105,9 +131,10 @@ def _upscale_video_impl(
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
-    gpu_type: str = "H100"
+    gpu_type: str = "H100",
+    job_id: Optional[str] = None
 ):
-    """Upscale a video using SeedVR2 from URL or base64 data"""
+    """Upscale a video using SeedVR2 from URL or base64 data with real-time progress updates"""
     import subprocess
     import tempfile
     import os
@@ -121,11 +148,14 @@ def _upscale_video_impl(
     print(f"🚀 Starting SeedVR2 upscaling on {gpu_type}")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, target={resolution}")
 
+    _update_job_progress(job_id, "🚀 Initializing upscaler...")
+
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
     # Clone repo to unique temp directory
     repo_dir = tempfile.mkdtemp(prefix="seedvr_")
     print(f"📂 Cloning repo to: {repo_dir}")
+    _update_job_progress(job_id, "📂 Cloning repository...")
 
     try:
         subprocess.run(
@@ -147,6 +177,7 @@ def _upscale_video_impl(
         # Download or decode video
         if video_url:
             print(f"📥 Downloading video from URL: {video_url}")
+            _update_job_progress(job_id, "📥 Downloading video...")
             response = requests.get(video_url, stream=True, timeout=300)
             response.raise_for_status()
 
@@ -158,6 +189,7 @@ def _upscale_video_impl(
             url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
         elif video_base64:
             print(f"📥 Decoding video from base64")
+            _update_job_progress(job_id, "📥 Decoding video...")
             video_bytes = b64decode(video_base64)
             with open(input_path, 'wb') as f:
                 f.write(video_bytes)
@@ -169,6 +201,7 @@ def _upscale_video_impl(
         print(f"📦 Input video size: {input_size_mb:.2f} MB")
 
         # Get video dimensions
+        _update_job_progress(job_id, "📐 Analyzing video dimensions...")
         cap = cv2.VideoCapture(input_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -218,55 +251,95 @@ def _upscale_video_impl(
             "--debug"
         ]
 
-        print(f"🔧 Running upscaler...")
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_dir)
+        print(f"🔧 Running upscaler with real-time logging...")
+        _update_job_progress(job_id, "🔧 Starting upscale process...")
 
-        if result.returncode != 0:
-            print(f"❌ Error: {result.stderr}")
-            raise Exception(f"Upscaling failed: {result.stderr}")
+        # Run with REAL-TIME OUTPUT STREAMING
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,  # Line buffered
+            cwd=repo_dir
+        )
 
-        print(result.stdout)
+        full_output = []
+        last_progress_update = ""
+
+        # Stream output line by line
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+
+            line = line.rstrip()
+            full_output.append(line)
+            print(line)  # Still print to Modal logs
+
+            # Extract interesting log lines for progress updates
+            progress_update = None
+
+            if "Window" in line and "-" in line:
+                # Example: "🧩 Window 0-99 (len=100)"
+                progress_update = line.strip()
+            elif "Time batch:" in line:
+                # Example: "🔄 Time batch: 107.80s"
+                progress_update = line.strip()
+            elif "Batch" in line and "/" in line:
+                # Example: "Processing batch 1/3"
+                progress_update = line.strip()
+            elif "Loading model" in line or "Model loaded" in line:
+                progress_update = "⚙️ " + line.strip()
+            elif "Downloading" in line:
+                progress_update = "⬇️ " + line.strip()
+            elif "Processing" in line and "frames" in line:
+                progress_update = "🎬 " + line.strip()
+
+            # Update progress if we found something interesting
+            if progress_update and progress_update != last_progress_update:
+                _update_job_progress(job_id, progress_update)
+                last_progress_update = progress_update
+
+        # Wait for process to complete
+        process.wait()
+
+        if process.returncode != 0:
+            error_msg = "\n".join(full_output[-20:])  # Last 20 lines
+            print(f"❌ Error: {error_msg}")
+            raise Exception(f"Upscaling failed: {error_msg}")
 
         if not os.path.exists(temp_output_path):
             raise Exception("Output file not created")
 
         output_size_mb = os.path.getsize(temp_output_path) / (1024 * 1024)
         print(f"✅ Output video size: {output_size_mb:.2f} MB")
+        _update_job_progress(job_id, "✅ Finalizing output...")
 
         # Generate unique filename
         timestamp = int(time_module.time())
-        filename = f"upscaled_{timestamp}_{url_hash}.mp4"
+        filename = f"{url_hash}_{resolution}_{timestamp}.mp4"
+        final_path = f"/outputs/{filename}"
 
-        # Copy to shared persistent storage
-        final_output_path = f"/outputs/{filename}"
-        print(f"💾 Copying to: {final_output_path}")
+        print(f"💾 Saving to: {final_path}")
+        shutil.copy2(temp_output_path, final_path)
 
-        with open(temp_output_path, 'rb') as src:
-            file_data = src.read()
-
-        with open(final_output_path, 'wb') as dst:
-            dst.write(file_data)
-
-        # Verify file
-        if not os.path.exists(final_output_path):
-            raise Exception(f"Failed to write to {final_output_path}")
-
-        verified_size = os.path.getsize(final_output_path) / (1024 * 1024)
-        print(f"✅ Verified: {verified_size:.2f} MB")
-
-        # Commit volume
+        # Force volume sync
         output_volume.commit()
-        print(f"📌 Volume committed")
 
-        # Clean up
-        os.chdir("/root")
-        shutil.rmtree(repo_dir, ignore_errors=True)
+        if not os.path.exists(final_path):
+            raise Exception(f"Failed to save to volume: {final_path}")
 
-        return {
-            "filename": filename,
-            "input_size_mb": input_size_mb,
-            "output_size_mb": output_size_mb
-        }
+        print(f"✅ Saved successfully: {filename}")
+
+    # Cleanup
+    os.chdir("/root")
+    shutil.rmtree(repo_dir, ignore_errors=True)
+
+    return {
+        "filename": filename,
+        "input_size_mb": input_size_mb,
+        "output_size_mb": output_size_mb
+    }
 
 
 @app.function(
@@ -337,12 +410,12 @@ def fastapi_app():
             job_data = load_job(job_id)
             if job_data:
                 job_data["status"] = "processing"
-                job_data["progress"] = "Upscaling in progress..."
+                job_data["progress"] = "Starting upscaler..."
                 save_job(job_id, job_data)
 
             print(f"[Job {job_id}] Starting upscale_video.remote()")
-            
-            # Select GPU based on resolution
+
+            # Select GPU based on resolution and pass job_id for progress updates
             if request.resolution in ['720p', '1080p']:
                 print(f"[Job {job_id}] Using H100 for {request.resolution}")
                 result = upscale_video_h100.remote(
@@ -352,7 +425,8 @@ def fastapi_app():
                     temporal_overlap=request.temporal_overlap,
                     stitch_mode=request.stitch_mode,
                     model=request.model,
-                    resolution=request.resolution
+                    resolution=request.resolution,
+                    job_id=job_id  # Pass job_id for real-time updates!
                 )
             else:  # 2k or 4k
                 print(f"[Job {job_id}] Using H200 for {request.resolution}")
@@ -363,7 +437,8 @@ def fastapi_app():
                     temporal_overlap=request.temporal_overlap,
                     stitch_mode=request.stitch_mode,
                     model=request.model,
-                    resolution=request.resolution
+                    resolution=request.resolution,
+                    job_id=job_id  # Pass job_id for real-time updates!
                 )
 
             filename = result["filename"]
@@ -386,7 +461,7 @@ def fastapi_app():
                     "filename": filename,
                     "input_size_mb": result["input_size_mb"],
                     "output_size_mb": result["output_size_mb"],
-                    "progress": "Completed successfully!"
+                    "progress": "✅ Completed successfully!"
                 })
                 save_job(job_id, job_data)
             print(f"[Job {job_id}] Status saved")
@@ -398,7 +473,7 @@ def fastapi_app():
                 job_data.update({
                     "status": "failed",
                     "error": str(e),
-                    "progress": f"Failed: {str(e)}"
+                    "progress": f"❌ Failed: {str(e)}"
                 })
                 save_job(job_id, job_data)
 
@@ -409,7 +484,7 @@ def fastapi_app():
             raise HTTPException(status_code=400, detail="Must provide either video_url or video_base64")
 
         job_id = str(uuid.uuid4())
-        
+
         # Determine GPU based on resolution
         gpu_type = "H100" if request.resolution in ['720p', '1080p'] else "H200"
 
@@ -485,7 +560,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "3.1 (H100 for 720p/1080p, H200 for 2K/4K)",
+            "version": "3.2 (H100 for 720p/1080p, H200 for 2K/4K) - REAL-TIME LOGS",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
