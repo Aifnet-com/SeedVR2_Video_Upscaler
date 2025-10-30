@@ -190,8 +190,8 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
     regular_batch_timeout = int(expected_batch_time * 1.5)
 
     # Absolute minimums to avoid false positives
-    first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
-    regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
+    # first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
+    # regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
 
     print(f"📊 Stall timeout calculation:")
     print(f"   Resolution: {resolution}, Batch size: {batch_size}")
