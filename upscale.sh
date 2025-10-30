@@ -63,13 +63,17 @@ echo "📁 Output will be saved to: $OUTPUT_FILE"
 echo ""
 
 # Poll status
+LAST_LINE_LENGTH=0
 while true; do
     STATUS=$(curl -s "$API_URL/status/$JOB_ID")
     STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
 
     # Handle initial sync delay (404s)
     if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
-        printf "\r⏳ Waiting for job to be registered..."
+        # Clear previous line and print new one
+        printf "\r%-${LAST_LINE_LENGTH}s\r" ""
+        printf "⏳ Waiting for job to be registered..."
+        LAST_LINE_LENGTH=38
         sleep 2
         continue
     fi
@@ -78,6 +82,8 @@ while true; do
     PROGRESS=$(echo $STATUS | jq -r '.progress')
 
     if [ "$STATE" = "completed" ]; then
+        # Clear the progress line
+        printf "\r%-${LAST_LINE_LENGTH}s\r" ""
         echo ""
         echo "✅ Job completed!"
         DOWNLOAD_URL=$(echo $STATUS | jq -r '.download_url')
@@ -99,6 +105,8 @@ while true; do
         break
 
     elif [ "$STATE" = "failed" ]; then
+        # Clear the progress line
+        printf "\r%-${LAST_LINE_LENGTH}s\r" ""
         ERROR=$(echo $STATUS | jq -r '.error')
         echo "❌ Job failed: $ERROR"
         exit 1
@@ -106,7 +114,16 @@ while true; do
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
-        printf "\r⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
+
+        # Build the status line
+        STATUS_LINE="⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
+
+        # Clear previous line completely, then print new one
+        printf "\r%-${LAST_LINE_LENGTH}s\r" ""
+        printf "%s" "$STATUS_LINE"
+
+        # Store length for next iteration
+        LAST_LINE_LENGTH=${#STATUS_LINE}
     fi
 
     sleep 5
