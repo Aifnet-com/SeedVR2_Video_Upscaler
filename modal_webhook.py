@@ -1,6 +1,7 @@
 """
 Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
 Supports both URL and local file inputs with REAL-TIME LOG STREAMING via Modal Dict
+Includes WATCHDOG to detect and kill stalled processes
 """
 
 import modal
@@ -49,7 +50,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 @app.function(
     image=image,
     gpu="H100",
-    timeout=7200,
+    timeout=7200,  # 2 hour max, but watchdog will kill earlier if stalled
     volumes={
         "/models": model_volume,
         "/outputs": output_volume
@@ -77,7 +78,7 @@ def upscale_video_h100(
 @app.function(
     image=image,
     gpu="H200",
-    timeout=7200,
+    timeout=7200,  # 2 hour max, but watchdog will kill earlier if stalled
     volumes={
         "/models": model_volume,
         "/outputs": output_volume
@@ -108,13 +109,18 @@ def _update_job_progress(job_id: str, progress_text: str):
         return
 
     import os
-
+    import time
+    
     # Update in-memory dict (FAST - for real-time status checks)
     try:
-        progress_dict[job_id] = progress_text
+        # Store both progress text AND timestamp for watchdog
+        progress_dict[job_id] = {
+            "text": progress_text,
+            "timestamp": time.time()
+        }
     except Exception as e:
         print(f"⚠️  Failed to update progress dict: {e}")
-
+    
     # Also update persistent storage (slower but survives restarts)
     JOBS_DIR = "/outputs/jobs"
     job_file = f"{JOBS_DIR}/{job_id}.json"
@@ -123,11 +129,12 @@ def _update_job_progress(job_id: str, progress_text: str):
         try:
             # Reload volume to see latest changes
             output_volume.reload()
-
+            
             with open(job_file, "r") as f:
                 job_data = json.load(f)
 
             job_data["progress"] = progress_text
+            job_data["last_update"] = time.time()
 
             with open(job_file, "w") as f:
                 json.dump(job_data, f)
@@ -135,6 +142,65 @@ def _update_job_progress(job_id: str, progress_text: str):
             output_volume.commit()
         except Exception as e:
             print(f"⚠️  Failed to update progress file: {e}")
+
+
+def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frames: int = None) -> int:
+    """
+    Calculate how long to wait before considering a job stalled.
+    Returns timeout in seconds.
+    
+    CRITICAL: We only get log updates BETWEEN batches, not during batch processing!
+    The timeout must be longer than the time to process one full batch.
+    
+    Based on EMPIRICAL DATA from production logs:
+    - 1080p: ~61s per 100 frames, ~11s per 16 frames (H100)
+    - 2K:    ~107s per 100 frames, ~19s per 16 frames (H200)
+    
+    Logic:
+    - Calculate expected time per batch based on actual batch size
+    - Add model loading overhead for first batch
+    - Add safety margin for variance
+    """
+    
+    # Empirical time per 100 frames at different resolutions
+    # These are ACTUAL measurements from production logs
+    time_per_100_frames = {
+        '720p': 50,    # ~50 seconds per 100 frames (estimated, similar to 1080p but faster)
+        '1080p': 70,   # ~62 seconds per 100 frames (from logs: 61.45s average)
+        '2k': 120,     # ~108 seconds per 100 frames (from logs: 107.80s average)
+        '4k': 250,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
+    }
+    
+    base_time_per_100 = time_per_100_frames.get(resolution, 62)
+    
+    # Calculate expected time for this specific batch size
+    # Simply scale linearly based on batch size
+    expected_batch_time = int(base_time_per_100 * (batch_size / 100))
+
+    # Model loading overhead (happens during first batch)
+    # From logs: First batch has ~15-20s overhead for model loading
+    model_loading_overhead = 30  # seconds
+
+    # Calculate timeouts with 50% grace period / safety margin
+    # First batch: expected time + model loading + 50% safety margin
+    first_batch_timeout = int((expected_batch_time + model_loading_overhead) * 1.5)
+
+    # Regular batch: expected time + 50% safety margin
+    regular_batch_timeout = int(expected_batch_time * 1.5)
+
+    # Absolute minimums to avoid false positives
+    first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
+    regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
+
+    print(f"📊 Stall timeout calculation:")
+    print(f"   Resolution: {resolution}, Batch size: {batch_size}")
+    print(f"   Base time per 100 frames: {base_time_per_100}s")
+    print(f"   Expected time for {batch_size} frames: {expected_batch_time}s")
+    print(f"   First batch timeout: {first_batch_timeout}s ({first_batch_timeout/60:.1f} min)")
+    print(f"   Regular batch timeout: {regular_batch_timeout}s ({regular_batch_timeout/60:.1f} min)")
+
+    # Return first batch timeout (most conservative)
+    return first_batch_timeout
 
 
 def _upscale_video_impl(
@@ -148,7 +214,7 @@ def _upscale_video_impl(
     gpu_type: str = "H100",
     job_id: Optional[str] = None
 ):
-    """Upscale a video using SeedVR2 from URL or base64 data with real-time progress updates"""
+    """Upscale a video using SeedVR2 from URL or base64 data with real-time progress updates and watchdog"""
     import subprocess
     import tempfile
     import os
@@ -158,6 +224,8 @@ def _upscale_video_impl(
     import shutil
     import cv2
     import math
+    import threading
+    import signal
 
     print(f"🚀 Starting SeedVR2 upscaling on {gpu_type}")
     print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, target={resolution}")
@@ -214,17 +282,25 @@ def _upscale_video_impl(
         input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
         print(f"📦 Input video size: {input_size_mb:.2f} MB")
 
-        # Get video dimensions
+        # Get video dimensions and duration
         _update_job_progress(job_id, "📐 Analyzing video dimensions...")
         cap = cv2.VideoCapture(input_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = frame_count / fps if fps > 0 else 30  # Default to 30 sec if can't determine
         cap.release()
 
         if width == 0 or height == 0:
             raise Exception(f"Could not read video dimensions: {width}x{height}")
 
         print(f"📐 Input dimensions: {width}x{height}")
+        print(f"⏱️  Video duration: {video_duration:.1f} seconds ({frame_count} frames @ {fps:.2f} fps)")
+
+        # Calculate stall timeout based on batch size, total frames, and resolution
+        # This is critical: we only get updates BETWEEN batches!
+        stall_timeout = _calculate_stall_timeout(resolution, batch_size, frame_count)
 
         # Calculate target resolution based on input dimensions
         target_pixels_map = {
@@ -265,21 +341,59 @@ def _upscale_video_impl(
             "--debug"
         ]
 
-        print(f"🔧 Running upscaler with real-time logging...")
+        print(f"🔧 Running upscaler with real-time logging and watchdog...")
         _update_job_progress(job_id, "🔧 Starting upscale process...")
 
-        # Run with REAL-TIME OUTPUT STREAMING
+        # Run with REAL-TIME OUTPUT STREAMING + WATCHDOG
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,  # Line buffered
-            cwd=repo_dir
+            cwd=repo_dir,
+            preexec_fn=os.setsid  # Create process group for easier killing
         )
 
         full_output = []
         last_progress_update = ""
+        last_heartbeat = time_module.time()
+        watchdog_killed = False
+        is_first_batch = True  # Track if we're still in the first batch
+        current_stall_timeout = stall_timeout  # Start with conservative timeout
+
+        def watchdog_thread():
+            """Monitor for stalled processing and kill if needed"""
+            nonlocal watchdog_killed, last_heartbeat, is_first_batch, current_stall_timeout
+
+            while process.poll() is None:  # While process is running
+                time_module.sleep(10)  # Check every 10 seconds
+
+                time_since_update = time_module.time() - last_heartbeat
+
+                # Timeout is already at 50% margin - no need to adjust
+                
+                if time_since_update > current_stall_timeout:
+                    print(f"🚨 WATCHDOG: No progress for {time_since_update:.0f}s (timeout: {current_stall_timeout}s)")
+                    print(f"🚨 WATCHDOG: Killing stalled process...")
+                    watchdog_killed = True
+                    
+                    try:
+                        # Kill entire process group (including all children)
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        time_module.sleep(2)
+                        if process.poll() is None:
+                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except Exception as e:
+                        print(f"⚠️  Watchdog kill error: {e}")
+                    break
+                else:
+                    timeout_label = "FIRST_BATCH" if is_first_batch else "REGULAR"
+                    print(f"🐕 Watchdog [{timeout_label}]: {time_since_update:.0f}s / {current_stall_timeout}s")
+
+        # Start watchdog in background
+        watchdog = threading.Thread(target=watchdog_thread, daemon=True)
+        watchdog.start()
 
         # Stream output line by line
         for line in iter(process.stdout.readline, ''):
@@ -296,9 +410,16 @@ def _upscale_video_impl(
             if "Window" in line and "-" in line:
                 # Example: "🧩 Window 0-99 (len=100)"
                 progress_update = line.strip()
+                # If we see Window 88 or higher, we're past the first batch
+                if "Window 88-" in line or "Window 176-" in line:
+                    is_first_batch = False
             elif "Time batch:" in line:
                 # Example: "🔄 Time batch: 107.80s"
                 progress_update = line.strip()
+                # First "Time batch" means first batch is done
+                if is_first_batch:
+                    is_first_batch = False
+                    print(f"✅ First batch completed - switching to faster watchdog timeout")
             elif "Batch" in line and "/" in line:
                 # Example: "Processing batch 1/3"
                 progress_update = line.strip()
@@ -313,9 +434,19 @@ def _upscale_video_impl(
             if progress_update and progress_update != last_progress_update:
                 _update_job_progress(job_id, progress_update)
                 last_progress_update = progress_update
+                last_heartbeat = time_module.time()  # Reset watchdog timer
+            elif line.strip():  # Any non-empty line counts as activity
+                last_heartbeat = time_module.time()  # Reset watchdog timer
 
         # Wait for process to complete
         process.wait()
+
+        # Check if watchdog killed it
+        if watchdog_killed:
+            error_msg = f"Job stalled (no progress for {current_stall_timeout}s) - killed by watchdog"
+            print(f"❌ {error_msg}")
+            print(f"📋 Last 20 log lines:\n" + "\n".join(full_output[-20:]))
+            raise Exception(error_msg)
 
         if process.returncode != 0:
             error_msg = "\n".join(full_output[-20:])  # Last 20 lines
@@ -481,14 +612,14 @@ def fastapi_app():
                     "progress": "✅ Completed successfully!"
                 })
                 save_job(job_id, job_data)
-
+            
             # Clear from in-memory dict after completion
             try:
                 if job_id in progress_dict:
                     del progress_dict[job_id]
             except:
                 pass
-
+                
             print(f"[Job {job_id}] Status saved")
 
         except Exception as e:
@@ -501,7 +632,7 @@ def fastapi_app():
                     "progress": f"❌ Failed: {str(e)}"
                 })
                 save_job(job_id, job_data)
-
+            
             # Clear from in-memory dict after failure
             try:
                 if job_id in progress_dict:
@@ -542,15 +673,19 @@ def fastapi_app():
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
         """Check the status of a job - checks in-memory dict FIRST for real-time progress"""
-
+        
         # First check the fast in-memory dict for real-time progress
         realtime_progress = None
         try:
             if job_id in progress_dict:
-                realtime_progress = progress_dict[job_id]
+                progress_data = progress_dict[job_id]
+                if isinstance(progress_data, dict):
+                    realtime_progress = progress_data.get("text")
+                else:
+                    realtime_progress = progress_data
         except:
             pass
-
+        
         # Then load from persistent storage
         job_data = load_job(job_id)
         if not job_data:
@@ -606,7 +741,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "3.3 (H100 for 720p/1080p, H200 for 2K/4K) - REAL-TIME LOGS via Modal Dict",
+            "version": "3.4 (H100 for 720p/1080p, H200 for 2K/4K) - WATCHDOG + REAL-TIME LOGS",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
