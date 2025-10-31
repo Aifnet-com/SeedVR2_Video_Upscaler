@@ -9,9 +9,6 @@ from typing import Dict, Optional
 import json
 from base64 import b64decode
 
-# DEBUG: Set to True to test watchdog (forces very short timeouts)
-WATCHDOG_TEST_MODE = False
-
 # Create Modal app
 app = modal.App("seedvr2-upscaler")
 
@@ -99,7 +96,7 @@ def upscale_video_h200(
     resolution: str = "1080p",
     job_id: Optional[str] = None
 ):
-    """Upscale a video using SeedVR2 from URL or base64 data (H200 for 2K)"""
+    """Upscale a video using SeedVR2 from URL or base64 data (H200 for 2K/4K)"""
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
         stitch_mode, model, resolution, gpu_type="H200", job_id=job_id
@@ -120,14 +117,14 @@ def upscale_video_h200(
 def upscale_video_b200(
     video_url: Optional[str] = None,
     video_base64: Optional[str] = None,
-    batch_size: int = 100,
-    temporal_overlap: int = 12,
+    batch_size: int = 50,
+    temporal_overlap: int = 8,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "4k",
     job_id: Optional[str] = None
 ):
-    """Upscale a video using SeedVR2 from URL or base64 data (B200 for 4K)"""
+    """Upscale a video using SeedVR2 (B200 for 4K)"""
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
         stitch_mode, model, resolution, gpu_type="B200", job_id=job_id
@@ -141,7 +138,7 @@ def _update_job_progress(job_id: str, progress_text: str):
 
     import os
     import time
-    
+
     # Update in-memory dict (FAST - for real-time status checks)
     try:
         # Store both progress text AND timestamp for watchdog
@@ -151,7 +148,7 @@ def _update_job_progress(job_id: str, progress_text: str):
         }
     except Exception as e:
         print(f"⚠️  Failed to update progress dict: {e}")
-    
+
     # Also update persistent storage (slower but survives restarts)
     JOBS_DIR = "/outputs/jobs"
     job_file = f"{JOBS_DIR}/{job_id}.json"
@@ -160,7 +157,7 @@ def _update_job_progress(job_id: str, progress_text: str):
         try:
             # Reload volume to see latest changes
             output_volume.reload()
-            
+
             with open(job_file, "r") as f:
                 job_data = json.load(f)
 
@@ -179,63 +176,57 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
     """
     Calculate how long to wait before considering a job stalled.
     Returns timeout in seconds.
-    
+
     CRITICAL: We only get log updates BETWEEN batches, not during batch processing!
     The timeout must be longer than the time to process one full batch.
-    
+
     Based on EMPIRICAL DATA from production logs:
     - 1080p: ~61s per 100 frames, ~11s per 16 frames (H100)
     - 2K:    ~107s per 100 frames, ~19s per 16 frames (H200)
-    
+
     Logic:
     - Calculate expected time per batch based on actual batch size
     - Add model loading overhead for first batch
     - Add safety margin for variance
     """
-    
+
     # Empirical time per 100 frames at different resolutions
     # These are ACTUAL measurements from production logs
     time_per_100_frames = {
         '720p': 50,    # ~50 seconds per 100 frames (estimated, similar to 1080p but faster)
-        '1080p': 62,   # ~62 seconds per 100 frames (from logs: 61.45s average)
-        '2k': 108,     # ~108 seconds per 100 frames (from logs: 107.80s average)
-        '4k': 200,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
+        '1080p': 70,   # ~62 seconds per 100 frames (from logs: 61.45s average)
+        '2k': 120,     # ~108 seconds per 100 frames (from logs: 107.80s average)
+        '4k': 250,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
     }
-    
+
     base_time_per_100 = time_per_100_frames.get(resolution, 62)
-    
+
     # Calculate expected time for this specific batch size
     # Simply scale linearly based on batch size
     expected_batch_time = int(base_time_per_100 * (batch_size / 100))
-    
+
     # Model loading overhead (happens during first batch)
     # From logs: First batch has ~15-20s overhead for model loading
-    model_loading_overhead = 20  # seconds
-    
-    # DEBUG MODE: Override timeouts for testing
-    if WATCHDOG_TEST_MODE:
-        print("⚠️  WATCHDOG TEST MODE ENABLED - Using 10 second timeout!")
-        first_batch_timeout = 10
-        regular_batch_timeout = 10
-    else:
-        # Calculate timeouts with 50% grace period / safety margin
-        # First batch: expected time + model loading + 50% safety margin
-        first_batch_timeout = int((expected_batch_time + model_loading_overhead) * 1.5)
-        
-        # Regular batch: expected time + 50% safety margin
-        regular_batch_timeout = int(expected_batch_time * 1.5)
-    
+    model_loading_overhead = 45  # seconds
+
+    # Calculate timeouts with 50% grace period / safety margin
+    # First batch: expected time + model loading + 50% safety margin
+    first_batch_timeout = int((expected_batch_time + model_loading_overhead) * 1.5)
+
+    # Regular batch: expected time + 50% safety margin
+    regular_batch_timeout = int(expected_batch_time * 1.5)
+
     # Absolute minimums to avoid false positives
     first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
     regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
-    
+
     print(f"📊 Stall timeout calculation:")
     print(f"   Resolution: {resolution}, Batch size: {batch_size}")
     print(f"   Base time per 100 frames: {base_time_per_100}s")
     print(f"   Expected time for {batch_size} frames: {expected_batch_time}s")
     print(f"   First batch timeout: {first_batch_timeout}s ({first_batch_timeout/60:.1f} min)")
     print(f"   Regular batch timeout: {regular_batch_timeout}s ({regular_batch_timeout/60:.1f} min)")
-    
+
     # Return first batch timeout (most conservative)
     return first_batch_timeout
 
@@ -402,19 +393,19 @@ def _upscale_video_impl(
         def watchdog_thread():
             """Monitor for stalled processing and kill if needed"""
             nonlocal watchdog_killed, last_heartbeat, is_first_batch, current_stall_timeout
-            
+
             while process.poll() is None:  # While process is running
                 time_module.sleep(10)  # Check every 10 seconds
-                
+
                 time_since_update = time_module.time() - last_heartbeat
-                
+
                 # Timeout is already at 50% margin - no need to adjust
-                
+
                 if time_since_update > current_stall_timeout:
                     print(f"🚨 WATCHDOG: No progress for {time_since_update:.0f}s (timeout: {current_stall_timeout}s)")
                     print(f"🚨 WATCHDOG: Killing stalled process...")
                     watchdog_killed = True
-                    
+
                     try:
                         # Kill entire process group (including all children)
                         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
@@ -560,6 +551,7 @@ def fastapi_app():
             output_volume.reload()
         if not os.path.exists(job_file):
             return None
+        with open(job_file, "r") import json as _json_reader;  # keep JSON escaping if needed
         with open(job_file, "r") as f:
             return json.load(f)
 
@@ -576,7 +568,7 @@ def fastapi_app():
         job_id: str
         status: str
         message: str
-        gpu_type: str  # H100, H200, or B200
+        gpu_type: str  # H100 or H200 or B200
 
     class JobStatus(BaseModel):
         job_id: str
@@ -588,145 +580,106 @@ def fastapi_app():
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
         elapsed_seconds: Optional[float] = None
-        retry_count: Optional[int] = 0  # Track retry attempts
 
     def process_video(job_id: str, request: UpscaleRequest):
-        """Background task to process video with retry logic"""
-        max_retries = 2
-        retry_count = 0
-        retry_delay = 5  # seconds between retries
-        
-        while retry_count <= max_retries:
+        """Background task to process video"""
+        try:
+            job_data = load_job(job_id)
+            if job_data:
+                job_data["status"] = "processing"
+                job_data["progress"] = "Starting upscaler..."
+                save_job(job_id, job_data)
+
+            print(f"[Job {job_id}] Starting upscale_video.remote()")
+
+            # Select GPU based on resolution and pass job_id for progress updates
+            if request.resolution in ['720p', '1080p']:
+                print(f"[Job {job_id}] Using H100 for {request.resolution}")
+                result = upscale_video_h100.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution,
+                    job_id=job_id  # Pass job_id for real-time updates!
+                )
+            elif request.resolution in ['2k', '2K', '1440p']:
+                print(f"[Job {job_id}] Using H200 for {request.resolution}")
+                result = upscale_video_h200.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution,
+                    job_id=job_id  # Pass job_id for real-time updates!
+                )
+            else:  # 4k (or anything else treated as 4k) -> B200
+                print(f"[Job {job_id}] Using B200 for {request.resolution}")
+                result = upscale_video_b200.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution,
+                    job_id=job_id  # Pass job_id for real-time updates!
+                )
+
+            filename = result["filename"]
+            print(f"[Job {job_id}] Upscale completed: {filename}")
+
+            # Verify file exists
+            final_path = f"/outputs/{filename}"
+            output_volume.reload()
+
+            if not os.path.exists(final_path):
+                raise Exception(f"Output file not found: {final_path}")
+
+            download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
+
+            job_data = load_job(job_id)
+            if job_data:
+                job_data.update({
+                    "status": "completed",
+                    "download_url": download_url,
+                    "filename": filename,
+                    "input_size_mb": result["input_size_mb"],
+                    "output_size_mb": result["output_size_mb"],
+                    "progress": "✅ Completed successfully!"
+                })
+                save_job(job_id, job_data)
+
+            # Clear from in-memory dict after completion
             try:
-                job_data = load_job(job_id)
-                if job_data:
-                    # Show attempt number in progress
-                    attempt_msg = f"Processing (attempt {retry_count + 1}/{max_retries + 1})..."
-                    job_data["status"] = "processing"
-                    job_data["progress"] = attempt_msg
-                    job_data["retry_count"] = retry_count
-                    save_job(job_id, job_data)
+                if job_id in progress_dict:
+                    del progress_dict[job_id]
+            except:
+                pass
 
-                print(f"[Job {job_id}] Starting upscale_video.remote() - Attempt {retry_count + 1}/{max_retries + 1}")
+            print(f"[Job {job_id}] Status saved")
 
-                # Select GPU based on resolution and pass job_id for progress updates
-                if request.resolution in ['720p', '1080p']:
-                    print(f"[Job {job_id}] Using H100 for {request.resolution}")
-                    result = upscale_video_h100.remote(
-                        video_url=request.video_url,
-                        video_base64=request.video_base64,
-                        batch_size=request.batch_size,
-                        temporal_overlap=request.temporal_overlap,
-                        stitch_mode=request.stitch_mode,
-                        model=request.model,
-                        resolution=request.resolution,
-                        job_id=job_id  # Pass job_id for real-time updates!
-                    )
-                elif request.resolution == '2k':
-                    print(f"[Job {job_id}] Using H200 for {request.resolution}")
-                    result = upscale_video_h200.remote(
-                        video_url=request.video_url,
-                        video_base64=request.video_base64,
-                        batch_size=request.batch_size,
-                        temporal_overlap=request.temporal_overlap,
-                        stitch_mode=request.stitch_mode,
-                        model=request.model,
-                        resolution=request.resolution,
-                        job_id=job_id  # Pass job_id for real-time updates!
-                    )
-                else:  # 4k
-                    print(f"[Job {job_id}] Using B200 for {request.resolution}")
-                    result = upscale_video_b200.remote(
-                        video_url=request.video_url,
-                        video_base64=request.video_base64,
-                        batch_size=request.batch_size,
-                        temporal_overlap=request.temporal_overlap,
-                        stitch_mode=request.stitch_mode,
-                        model=request.model,
-                        resolution=request.resolution,
-                        job_id=job_id  # Pass job_id for real-time updates!
-                    )
+        except Exception as e:
+            print(f"[Job {job_id}] Error: {str(e)}")
+            job_data = load_job(job_id)
+            if job_data:
+                job_data.update({
+                    "status": "failed",
+                    "error": str(e),
+                    "progress": f"❌ Failed: {str(e)}"
+                })
+                save_job(job_id, job_data)
 
-                filename = result["filename"]
-                print(f"[Job {job_id}] Upscale completed: {filename}")
-
-                # Verify file exists
-                final_path = f"/outputs/{filename}"
-                output_volume.reload()
-
-                if not os.path.exists(final_path):
-                    raise Exception(f"Output file not found: {final_path}")
-
-                download_url = f"https://aifnet--seedvr2-upscaler-fastapi-app.modal.run/download/{filename}"
-
-                job_data = load_job(job_id)
-                if job_data:
-                    job_data.update({
-                        "status": "completed",
-                        "download_url": download_url,
-                        "filename": filename,
-                        "input_size_mb": result["input_size_mb"],
-                        "output_size_mb": result["output_size_mb"],
-                        "progress": "✅ Completed successfully!",
-                        "retry_count": retry_count  # Track successful attempt
-                    })
-                    save_job(job_id, job_data)
-                
-                # Clear from in-memory dict after completion
-                try:
-                    if job_id in progress_dict:
-                        del progress_dict[job_id]
-                except:
-                    pass
-                    
-                print(f"[Job {job_id}] Status saved")
-                return  # SUCCESS - exit retry loop
-
-            except Exception as e:
-                error_str = str(e)
-                
-                # Check if this is a watchdog timeout (retryable error)
-                is_watchdog_timeout = "killed by watchdog" in error_str or "Job stalled" in error_str
-                
-                if is_watchdog_timeout and retry_count < max_retries:
-                    # RETRY LOGIC
-                    retry_count += 1
-                    print(f"⚠️  [Job {job_id}] Watchdog timeout on attempt {retry_count}")
-                    print(f"⚠️  [Job {job_id}] Retrying in {retry_delay}s... (Retry {retry_count}/{max_retries})")
-                    
-                    # Update job status to show retry
-                    job_data = load_job(job_id)
-                    if job_data:
-                        job_data["progress"] = f"⚠️ Timeout - retrying in {retry_delay}s (retry {retry_count}/{max_retries})"
-                        job_data["retry_count"] = retry_count
-                        save_job(job_id, job_data)
-                    
-                    time.sleep(retry_delay)
-                    continue  # Try again
-                    
-                else:
-                    # FINAL FAILURE (not timeout OR max retries reached)
-                    print(f"❌ [Job {job_id}] Final failure after {retry_count} retries: {error_str}")
-                    
-                    job_data = load_job(job_id)
-                    if job_data:
-                        failure_msg = f"❌ Failed after {retry_count} retries: {error_str}"
-                        job_data.update({
-                            "status": "failed",
-                            "error": error_str,
-                            "progress": failure_msg,
-                            "retry_count": retry_count
-                        })
-                        save_job(job_id, job_data)
-                    
-                    # Clear from in-memory dict after failure
-                    try:
-                        if job_id in progress_dict:
-                            del progress_dict[job_id]
-                    except:
-                        pass
-                    
-                    return  # FAILURE - exit retry loop
+            # Clear from in-memory dict after failure
+            try:
+                if job_id in progress_dict:
+                    del progress_dict[job_id]
+            except:
+                pass
 
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest):
@@ -739,9 +692,9 @@ def fastapi_app():
         # Determine GPU based on resolution
         if request.resolution in ['720p', '1080p']:
             gpu_type = "H100"
-        elif request.resolution == '2k':
+        elif request.resolution in ['2k', '2K', '1440p']:
             gpu_type = "H200"
-        else:  # 4k
+        else:  # default 4k -> B200
             gpu_type = "B200"
 
         job_data = {
@@ -766,7 +719,7 @@ def fastapi_app():
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
         """Check the status of a job - checks in-memory dict FIRST for real-time progress"""
-        
+
         # First check the fast in-memory dict for real-time progress
         realtime_progress = None
         try:
@@ -778,7 +731,7 @@ def fastapi_app():
                     realtime_progress = progress_data
         except:
             pass
-        
+
         # Then load from persistent storage
         job_data = load_job(job_id)
         if not job_data:
@@ -802,8 +755,7 @@ def fastapi_app():
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
             error=job_data.get("error"),
-            elapsed_seconds=elapsed_seconds,
-            retry_count=job_data.get("retry_count", 0)  # Include retry count
+            elapsed_seconds=elapsed_seconds
         )
 
     @web_app.get("/download/{filename}")
@@ -817,6 +769,7 @@ def fastapi_app():
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
+        from fastapi.responses import FileResponse  # ensure within scope
         return FileResponse(
             file_path,
             media_type="video/mp4",
@@ -835,16 +788,11 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "4.1 (H100 for 720p/1080p, H200 for 2K, B200 for 4K) - WATCHDOG + RETRIES + REAL-TIME LOGS",
+            "version": "3.5 (H100: 720p/1080p, H200: 2K, B200: 4K) - WATCHDOG + REAL-TIME LOGS",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
                 "download": "GET /download/{filename}"
-            },
-            "features": {
-                "watchdog": "Auto-kills stalled jobs",
-                "retries": "2 automatic retries on timeout",
-                "real_time_logs": "Live progress updates"
             },
             "active_jobs": active_count
         }
