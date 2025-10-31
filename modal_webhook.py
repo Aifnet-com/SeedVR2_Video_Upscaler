@@ -43,34 +43,6 @@ image = (
     )
 )
 
-image_b200 = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
-    .pip_install(
-        # Blackwell (sm_100) support: use cu128 nightlies
-        "torch>=2.7.0.dev0",
-        "torchvision>=0.22.0.dev0",
-        "torchaudio>=2.7.0.dev0",
-        index_url="https://download.pytorch.org/whl/nightly/cu128",
-    )
-    .pip_install(
-        "opencv-python-headless==4.10.0.84",
-        "numpy>=1.26.4",
-        "safetensors>=0.4.5",
-        "einops",
-        "omegaconf>=2.3.0",
-        "diffusers>=0.34.0",
-        "pytorch-extension",
-        "rotary_embedding_torch",
-        "peft>=0.15.0",
-        "transformers>=4.46.3",
-        "accelerate>=1.1.1",
-        "huggingface-hub>=0.26.2",
-        "requests>=2.32.3",
-        "fastapi[standard]"
-    )
-)
-
 # Create persistent volumes
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True)
@@ -128,34 +100,6 @@ def upscale_video_h200(
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
         stitch_mode, model, resolution, gpu_type="H200", job_id=job_id
-    )
-
-
-@app.function(
-    image=image_b200,
-    gpu="B200",
-    timeout=7200,  # 2 hour max, but watchdog will kill earlier if stalled
-    volumes={
-        "/models": model_volume,
-        "/outputs": output_volume
-    },
-    scaledown_window=300,
-    max_containers=10,
-)
-def upscale_video_b200(
-    video_url: Optional[str] = None,
-    video_base64: Optional[str] = None,
-    batch_size: int = 5,
-    temporal_overlap: int = 0,
-    stitch_mode: str = "crossfade",
-    model: str = "seedvr2_ema_7b_fp16.safetensors",
-    resolution: str = "4k",
-    job_id: Optional[str] = None
-):
-    """Upscale a video using SeedVR2 (B200 for 4K)"""
-    return _upscale_video_impl(
-        video_url, video_base64, batch_size, temporal_overlap,
-        stitch_mode, model, resolution, gpu_type="B200", job_id=job_id
     )
 
 
@@ -224,7 +168,7 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
         '720p': 50,    # ~50 seconds per 100 frames (estimated, similar to 1080p but faster)
         '1080p': 70,   # ~62 seconds per 100 frames (from logs: 61.45s average)
         '2k': 120,     # ~108 seconds per 100 frames (from logs: 107.80s average)
-        '4k': 500,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
+        '4k': 250,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
     }
 
     base_time_per_100 = time_per_100_frames.get(resolution, 62)
@@ -585,8 +529,8 @@ def fastapi_app():
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
         video_base64: Optional[str] = None
-        batch_size: int = 3
-        temporal_overlap: int = 0
+        batch_size: int = 100
+        temporal_overlap: int = 12
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
         resolution: str = "1080p"
@@ -595,7 +539,7 @@ def fastapi_app():
         job_id: str
         status: str
         message: str
-        gpu_type: str  # H100 or H200 or B200
+        gpu_type: str  # H100 or H200
 
     class JobStatus(BaseModel):
         job_id: str
@@ -632,21 +576,9 @@ def fastapi_app():
                     resolution=request.resolution,
                     job_id=job_id  # Pass job_id for real-time updates!
                 )
-            elif request.resolution in ['2k', '2K', '1440p']:
+            else:  # 2k or 4k
                 print(f"[Job {job_id}] Using H200 for {request.resolution}")
                 result = upscale_video_h200.remote(
-                    video_url=request.video_url,
-                    video_base64=request.video_base64,
-                    batch_size=request.batch_size,
-                    temporal_overlap=request.temporal_overlap,
-                    stitch_mode=request.stitch_mode,
-                    model=request.model,
-                    resolution=request.resolution,
-                    job_id=job_id  # Pass job_id for real-time updates!
-                )
-            else:  # 4k (or anything else treated as 4k) -> B200
-                print(f"[Job {job_id}] Using B200 for {request.resolution}")
-                result = upscale_video_b200.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
                     batch_size=request.batch_size,
@@ -717,12 +649,7 @@ def fastapi_app():
         job_id = str(uuid.uuid4())
 
         # Determine GPU based on resolution
-        if request.resolution in ['720p', '1080p']:
-            gpu_type = "H100"
-        elif request.resolution in ['2k', '2K', '1440p']:
-            gpu_type = "H200"
-        else:  # default 4k -> B200
-            gpu_type = "B200"
+        gpu_type = "H100" if request.resolution in ['720p', '1080p'] else "H200"
 
         job_data = {
             "job_id": job_id,
@@ -796,7 +723,6 @@ def fastapi_app():
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
-        from fastapi.responses import FileResponse  # ensure within scope
         return FileResponse(
             file_path,
             media_type="video/mp4",
@@ -815,7 +741,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "3.5 (H100: 720p/1080p, H200: 2K, B200: 4K) - WATCHDOG + REAL-TIME LOGS",
+            "version": "3.4 (H100 for 720p/1080p, H200 for 2K/4K) - WATCHDOG + REAL-TIME LOGS",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
