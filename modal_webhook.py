@@ -196,7 +196,7 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
         '720p': 50,    # ~50 seconds per 100 frames (estimated, similar to 1080p but faster)
         '1080p': 70,   # ~62 seconds per 100 frames (from logs: 61.45s average)
         '2k': 120,     # ~108 seconds per 100 frames (from logs: 107.80s average)
-        '4k': 2000,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
+        '4k': 5000,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
     }
 
     base_time_per_100 = time_per_100_frames.get(resolution, 62)
