@@ -46,11 +46,11 @@ image = (
 image_b200 = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
-    # Nightly cu126 with sm_100 support (Blackwell). Replace with stable cu126 when available.
     .pip_install(
-        "torch==2.6.0.dev*",
-        "torchvision==0.21.0.dev*",
-        "torchaudio==2.6.0.dev*",
+        # PEP 440 dev-range enables pre-releases
+        "torch>=2.6.0.dev0",
+        "torchvision>=0.21.0.dev0",
+        "torchaudio>=2.6.0.dev0",
         index_url="https://download.pytorch.org/whl/nightly/cu126",
     )
     .pip_install(
