@@ -47,11 +47,11 @@ image_b200 = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
     .pip_install(
-        # PEP 440 dev-range enables pre-releases
-        "torch>=2.6.0.dev0",
-        "torchvision>=0.21.0.dev0",
-        "torchaudio>=2.6.0.dev0",
-        index_url="https://download.pytorch.org/whl/nightly/cu126",
+        # Blackwell (sm_100) support: use cu128 nightlies
+        "torch>=2.7.0.dev0",
+        "torchvision>=0.22.0.dev0",
+        "torchaudio>=2.7.0.dev0",
+        index_url="https://download.pytorch.org/whl/nightly/cu128",
     )
     .pip_install(
         "opencv-python-headless==4.10.0.84",
