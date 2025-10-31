@@ -183,15 +183,14 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
 
     # Calculate timeouts with 50% grace period / safety margin
     # First batch: expected time + model loading + 50% safety margin
-    # first_batch_timeout = int((expected_batch_time + model_loading_overhead) * 1.5)
-    first_batch_timeout = 1
+    first_batch_timeout = int((expected_batch_time + model_loading_overhead) * 1.5)
 
     # Regular batch: expected time + 50% safety margin
     regular_batch_timeout = int(expected_batch_time * 1.5)
 
     # Absolute minimums to avoid false positives
-    # first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
-    # regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
+    first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
+    regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
 
     print(f"📊 Stall timeout calculation:")
     print(f"   Resolution: {resolution}, Batch size: {batch_size}")
