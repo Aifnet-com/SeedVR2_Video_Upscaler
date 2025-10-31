@@ -551,7 +551,6 @@ def fastapi_app():
             output_volume.reload()
         if not os.path.exists(job_file):
             return None
-        with open(job_file, "r") import json as _json_reader;  # keep JSON escaping if needed
         with open(job_file, "r") as f:
             return json.load(f)
 
