@@ -145,7 +145,7 @@ def upscale_video_h200(
 def upscale_video_b200(
     video_url: Optional[str] = None,
     video_base64: Optional[str] = None,
-    batch_size: int = 25,
+    batch_size: int = 10,
     temporal_overlap: int = 8,
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
@@ -585,7 +585,7 @@ def fastapi_app():
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
         video_base64: Optional[str] = None
-        batch_size: int = 25
+        batch_size: int = 10
         temporal_overlap: int = 8
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
