@@ -557,8 +557,8 @@ def fastapi_app():
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
         video_base64: Optional[str] = None
-        batch_size: int = 100
-        temporal_overlap: int = 12
+        batch_size: int = 50
+        temporal_overlap: int = 8
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
         resolution: str = "1080p"
@@ -591,57 +591,42 @@ def fastapi_app():
 
             print(f"[Job {job_id}] Starting upscale_video.remote()")
 
-            # Figure out what the client actually set (vs. model defaults)
-            provided = request.model_dump(exclude_unset=True)
-
-            # Start from the request values (which currently default to 100/12)
-            bs = request.batch_size
-            ov = request.temporal_overlap
-
-            # Apply conditional defaults ONLY for 4K when the client didn't provide them
-            is_4k = str(request.resolution).lower() in {"4k", "2160p", "ultra_hd"}
-            if is_4k:
-                if "batch_size" not in provided:
-                    bs = 50
-                if "temporal_overlap" not in provided:
-                    ov = 8
-
-            # Route by resolution and pass resolved bs/ov
+            # Select GPU based on resolution and pass job_id for progress updates
             if request.resolution in ['720p', '1080p']:
-                print(f"[Job {job_id}] Using H100 for {request.resolution} (bs={bs}, ov={ov})")
+                print(f"[Job {job_id}] Using H100 for {request.resolution}")
                 result = upscale_video_h100.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
-                    batch_size=bs,
-                    temporal_overlap=ov,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id  # Pass job_id for real-time updates!
                 )
             elif request.resolution in ['2k', '2K', '1440p']:
-                print(f"[Job {job_id}] Using H200 for {request.resolution} (bs={bs}, ov={ov})")
+                print(f"[Job {job_id}] Using H200 for {request.resolution}")
                 result = upscale_video_h200.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
-                    batch_size=bs,
-                    temporal_overlap=ov,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id  # Pass job_id for real-time updates!
                 )
-            else:  # 4K -> B200
-                print(f"[Job {job_id}] Using B200 for {request.resolution} (bs={bs}, ov={ov})")
+            else:  # 4k (or anything else treated as 4k) -> B200
+                print(f"[Job {job_id}] Using B200 for {request.resolution}")
                 result = upscale_video_b200.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
-                    batch_size=bs,
-                    temporal_overlap=ov,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id  # Pass job_id for real-time updates!
                 )
 
             filename = result["filename"]
