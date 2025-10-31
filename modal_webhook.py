@@ -43,6 +43,34 @@ image = (
     )
 )
 
+image_b200 = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
+    # Nightly cu126 with sm_100 support (Blackwell). Replace with stable cu126 when available.
+    .pip_install(
+        "torch==2.6.0.dev*",
+        "torchvision==0.21.0.dev*",
+        "torchaudio==2.6.0.dev*",
+        index_url="https://download.pytorch.org/whl/nightly/cu126",
+    )
+    .pip_install(
+        "opencv-python-headless==4.10.0.84",
+        "numpy>=1.26.4",
+        "safetensors>=0.4.5",
+        "einops",
+        "omegaconf>=2.3.0",
+        "diffusers>=0.34.0",
+        "pytorch-extension",
+        "rotary_embedding_torch",
+        "peft>=0.15.0",
+        "transformers>=4.46.3",
+        "accelerate>=1.1.1",
+        "huggingface-hub>=0.26.2",
+        "requests>=2.32.3",
+        "fastapi[standard]"
+    )
+)
+
 # Create persistent volumes
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True)
@@ -104,7 +132,7 @@ def upscale_video_h200(
 
 
 @app.function(
-    image=image,
+    image=image_b200,
     gpu="B200",
     timeout=7200,  # 2 hour max, but watchdog will kill earlier if stalled
     volumes={
@@ -196,7 +224,7 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
         '720p': 50,    # ~50 seconds per 100 frames (estimated, similar to 1080p but faster)
         '1080p': 70,   # ~62 seconds per 100 frames (from logs: 61.45s average)
         '2k': 120,     # ~108 seconds per 100 frames (from logs: 107.80s average)
-        '4k': 5000,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
+        '4k': 500,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
     }
 
     base_time_per_100 = time_per_100_frames.get(resolution, 62)
@@ -557,8 +585,8 @@ def fastapi_app():
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
         video_base64: Optional[str] = None
-        batch_size: int = 20
-        temporal_overlap: int = 5
+        batch_size: int = 50
+        temporal_overlap: int = 8
         stitch_mode: str = "crossfade"
         model: str = "seedvr2_ema_7b_fp16.safetensors"
         resolution: str = "1080p"
