@@ -50,7 +50,7 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 @app.function(
     image=image,
     gpu="H100",
-    timeout=7200,  # 2 hour max, but watchdog will kill earlier if stalled
+    timeout=7200,
     volumes={
         "/models": model_volume,
         "/outputs": output_volume
@@ -78,7 +78,7 @@ def upscale_video_h100(
 @app.function(
     image=image,
     gpu="H200",
-    timeout=7200,  # 2 hour max, but watchdog will kill earlier if stalled
+    timeout=7200,
     volumes={
         "/models": model_volume,
         "/outputs": output_volume
@@ -111,9 +111,7 @@ def _update_job_progress(job_id: str, progress_text: str):
     import os
     import time
 
-    # Update in-memory dict (FAST - for real-time status checks)
     try:
-        # Store both progress text AND timestamp for watchdog
         progress_dict[job_id] = {
             "text": progress_text,
             "timestamp": time.time()
@@ -121,13 +119,11 @@ def _update_job_progress(job_id: str, progress_text: str):
     except Exception as e:
         print(f"⚠️  Failed to update progress dict: {e}")
 
-    # Also update persistent storage (slower but survives restarts)
     JOBS_DIR = "/outputs/jobs"
     job_file = f"{JOBS_DIR}/{job_id}.json"
 
     if os.path.exists(job_file):
         try:
-            # Reload volume to see latest changes
             output_volume.reload()
 
             with open(job_file, "r") as f:
@@ -165,21 +161,19 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
     # Empirical time per 100 frames at different resolutions
     # These are ACTUAL measurements from production logs
     time_per_100_frames = {
-        '720p': 50,    # ~50 seconds per 100 frames (estimated, similar to 1080p but faster)
-        '1080p': 70,   # ~62 seconds per 100 frames (from logs: 61.45s average)
-        '2k': 120,     # ~108 seconds per 100 frames (from logs: 107.80s average)
-        '4k': 250,     # ~200 seconds per 100 frames (estimated, scaled from 2K)
+        '720p': 50,    # ~50 seconds per 100 frames
+        '1080p': 70,   # ~70 seconds per 100 frames
+        '2k': 120,     # ~120 seconds per 100 frames
+        '4k': 250,     # ~250 seconds per 100 frames
     }
 
     base_time_per_100 = time_per_100_frames.get(resolution, 62)
 
     # Calculate expected time for this specific batch size
-    # Simply scale linearly based on batch size
     expected_batch_time = int(base_time_per_100 * (batch_size / 100))
 
     # Model loading overhead (happens during first batch)
-    # From logs: First batch has ~15-20s overhead for model loading
-    model_loading_overhead = 45  # seconds
+    model_loading_overhead = 45
 
     # Calculate timeouts with 50% grace period / safety margin
     # First batch: expected time + model loading + 50% safety margin
@@ -189,8 +183,8 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frame
     regular_batch_timeout = int(expected_batch_time * 1.5)
 
     # Absolute minimums to avoid false positives
-    first_batch_timeout = max(first_batch_timeout, 180)    # Min 3 minutes for first batch
-    regular_batch_timeout = max(regular_batch_timeout, 60)  # Min 1 minute for regular batches
+    first_batch_timeout = max(first_batch_timeout, 180)
+    regular_batch_timeout = max(regular_batch_timeout, 60)
 
     print(f"📊 Stall timeout calculation:")
     print(f"   Resolution: {resolution}, Batch size: {batch_size}")
@@ -289,7 +283,7 @@ def _upscale_video_impl(
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_duration = frame_count / fps if fps > 0 else 30  # Default to 30 sec if can't determine
+        video_duration = frame_count / fps if fps > 0 else 30
         cap.release()
 
         if width == 0 or height == 0:
@@ -314,8 +308,8 @@ def _upscale_video_impl(
 
         # Initial scale based on target pixel count
         ratio = math.sqrt(target_pixels / (width * height))
-        new_width = width * ratio      # Keep as float for precision
-        new_height = height * ratio    # Keep as float for precision
+        new_width = width * ratio
+        new_height = height * ratio
 
         # Round BOTH dimensions to nearest multiple of 16
         new_width = round(new_width / 16) * 16
@@ -350,28 +344,26 @@ def _upscale_video_impl(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,  # Line buffered
+            bufsize=1,
             cwd=repo_dir,
-            preexec_fn=os.setsid  # Create process group for easier killing
+            preexec_fn=os.setsid
         )
 
         full_output = []
         last_progress_update = ""
         last_heartbeat = time_module.time()
         watchdog_killed = False
-        is_first_batch = True  # Track if we're still in the first batch
-        current_stall_timeout = stall_timeout  # Start with conservative timeout
+        is_first_batch = True
+        current_stall_timeout = stall_timeout
 
         def watchdog_thread():
             """Monitor for stalled processing and kill if needed"""
             nonlocal watchdog_killed, last_heartbeat, is_first_batch, current_stall_timeout
 
-            while process.poll() is None:  # While process is running
-                time_module.sleep(10)  # Check every 10 seconds
+            while process.poll() is None:
+                time_module.sleep(10)
 
                 time_since_update = time_module.time() - last_heartbeat
-
-                # Timeout is already at 50% margin - no need to adjust
 
                 if time_since_update > current_stall_timeout:
                     print(f"🚨 WATCHDOG: No progress for {time_since_update:.0f}s (timeout: {current_stall_timeout}s)")
@@ -410,9 +402,6 @@ def _upscale_video_impl(
             if "Window" in line and "-" in line:
                 # Example: "🧩 Window 0-99 (len=100)"
                 progress_update = line.strip()
-                # If we see Window 88 or higher, we're past the first batch
-                if "Window 88-" in line or "Window 176-" in line:
-                    is_first_batch = False
             elif "Time batch:" in line:
                 # Example: "🔄 Time batch: 107.80s"
                 progress_update = line.strip()
@@ -576,7 +565,7 @@ def fastapi_app():
                     resolution=request.resolution,
                     job_id=job_id  # Pass job_id for real-time updates!
                 )
-            else:  # 2k or 4k
+            else:
                 print(f"[Job {job_id}] Using H200 for {request.resolution}")
                 result = upscale_video_h200.remote(
                     video_url=request.video_url,
