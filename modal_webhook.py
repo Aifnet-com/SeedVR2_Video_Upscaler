@@ -216,10 +216,9 @@ def _update_job_progress(job_id: str, progress_text: str):
             job_data["progress"] = progress_text
             job_data["last_update"] = time.time()
 
-            with open(job_file, "w") as f:
-                json.dump(job_data, f)
-
+            atomic_json_write(job_file, job_data)
             schedule_volume_commit(output_volume, wait_seconds=12)
+
         except Exception as e:
             print(f"⚠️  Failed to update progress file: {e}")
 
@@ -592,12 +591,10 @@ def fastapi_app():
         """Load job from persistent storage"""
         job_file = f"{JOBS_DIR}/{job_id}.json"
         if not os.path.exists(job_file):
-            # Try reloading volume in case it was just created
             output_volume.reload()
         if not os.path.exists(job_file):
             return None
-        with open(job_file, "r") as f:
-            return json.load(f)
+        return robust_json_load(job_file, volume=output_volume)
 
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
@@ -745,33 +742,30 @@ def fastapi_app():
 
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
-        """Check the status of a job - checks in-memory dict FIRST for real-time progress"""
-
-        # First check the fast in-memory dict for real-time progress
         realtime_progress = None
         try:
             if job_id in progress_dict:
-                progress_data = progress_dict[job_id]
-                if isinstance(progress_data, dict):
-                    realtime_progress = progress_data.get("text")
-                else:
-                    realtime_progress = progress_data
+                pd = progress_dict[job_id]
+                realtime_progress = pd.get("text") if isinstance(pd, dict) else pd
         except:
             pass
 
-        # Then load from persistent storage
-        job_data = load_job(job_id)
+        try:
+            job_data = load_job(job_id)
+        except Exception as e:
+            # transient decode or sync race — report finalizing
+            return JobStatus(job_id=job_id, status="processing",
+                             progress=realtime_progress or "finalizing",
+                             error=None)
+
         if not job_data:
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # Use real-time progress if available, otherwise fall back to stored progress
         if realtime_progress:
             job_data["progress"] = realtime_progress
 
         created_at = job_data.get("created_at")
-        elapsed_seconds = None
-        if created_at:
-            elapsed_seconds = time.time() - created_at
+        elapsed_seconds = time.time() - created_at if created_at else None
 
         return JobStatus(
             job_id=job_id,
