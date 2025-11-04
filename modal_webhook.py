@@ -1,9 +1,11 @@
 """
-Modal deployment with HYBRID result delivery strategy:
-1. PRIMARY: Try to get result from .remote() call (fast path - 99% of cases)
-2. FALLBACK: Read result from volume if .remote() fails (handles container hangs)
+Modal deployment with FILE-BASED result delivery:
+- Fire off .remote() call and don't wait for it
+- Immediately start polling for result file in /outputs/results/
+- Use atomic writes to prevent partial reads
+- 100% reliable regardless of container shutdown issues
 
-This ensures 100% success rate with minimal overhead
+This completely avoids the container hang problem by not relying on .remote() returning
 """
 
 import modal
@@ -12,6 +14,7 @@ import json
 from base64 import b64decode
 import time
 import os
+import threading
 
 app = modal.App("seedvr2-upscaler")
 
@@ -171,7 +174,7 @@ def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
 def _write_result_file(job_id: str, result_data: dict):
     """
     Write result to volume using atomic write pattern
-    This prevents partial reads and ensures result is available even if container hangs
+    Prevents partial reads by writing to temp file first, then renaming
     """
     if not job_id:
         return
@@ -226,7 +229,7 @@ def _upscale_video_impl(
     gpu_type: str = "H100",
     job_id: Optional[str] = None
 ):
-    """Upscale video and write result to volume before returning"""
+    """Upscale video and ALWAYS write result to volume before returning"""
     import subprocess
     import tempfile
     import os
@@ -482,7 +485,7 @@ def _upscale_video_impl(
             # CRITICAL: Write result to volume BEFORE returning
             _write_result_file(job_id, result)
 
-            print(f"✅ Result file written, returning result dict")
+            print(f"✅ Result file written, container can safely exit now")
 
             return result
 
@@ -510,6 +513,7 @@ def fastapi_app():
     import uuid
     import os
     import asyncio
+    import threading
 
     web_app = FastAPI()
 
@@ -537,38 +541,33 @@ def fastapi_app():
     def read_result_file(job_id: str) -> Optional[dict]:
         """
         Read result file from volume with validation
-        Uses polling to handle volume sync delays
+        Returns None if file doesn't exist yet
         """
         result_file = f"{RESULTS_DIR}/{job_id}.json"
 
-        # Try multiple times with volume reload
-        for attempt in range(12):  # 12 attempts * 5 seconds = 60 seconds total
-            if os.path.exists(result_file):
-                try:
-                    with open(result_file, "r") as f:
-                        result = json.load(f)
+        if not os.path.exists(result_file):
+            output_volume.reload()
 
-                    # Validate required fields
-                    if "status" in result:
-                        if result["status"] == "success" and "filename" in result:
-                            return result
-                        elif result["status"] == "error":
-                            return result
-                        else:
-                            print(f"⚠️  Invalid result structure, retrying...")
+        if not os.path.exists(result_file):
+            return None
 
-                except json.JSONDecodeError as e:
-                    # File exists but invalid JSON - might be mid-write (shouldn't happen with atomic writes)
-                    print(f"⚠️  Invalid JSON (attempt {attempt + 1}/12): {e}")
-                except Exception as e:
-                    print(f"⚠️  Error reading result file (attempt {attempt + 1}/12): {e}")
+        try:
+            with open(result_file, "r") as f:
+                result = json.load(f)
+
+            # Validate required fields
+            if "status" in result:
+                return result
             else:
-                # File doesn't exist yet, reload volume
-                output_volume.reload()
+                print(f"⚠️  Invalid result structure")
+                return None
 
-            time.sleep(5)
-
-        return None
+        except json.JSONDecodeError as e:
+            print(f"⚠️  Invalid JSON in result file: {e}")
+            return None
+        except Exception as e:
+            print(f"⚠️  Error reading result file: {e}")
+            return None
 
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
@@ -598,9 +597,8 @@ def fastapi_app():
 
     def process_video(job_id: str, request: UpscaleRequest):
         """
-        HYBRID STRATEGY:
-        1. PRIMARY: Try to get result from .remote() call (fast path)
-        2. FALLBACK: Read from volume if .remote() fails (safe path)
+        NEW STRATEGY: Fire off .remote() and immediately poll for result file
+        Completely ignore .remote() return value - we only read from volume
         """
         try:
             job_data = load_job(job_id)
@@ -619,63 +617,59 @@ def fastapi_app():
                 print(f"[Job {job_id}] Using H200 for {request.resolution}")
                 remote_function = upscale_video_h200
 
+            # Fire off .remote() in background thread (don't wait for it!)
+            def call_remote():
+                """Fire and forget - we don't care about return value"""
+                try:
+                    print(f"[Job {job_id}] Calling .remote() in background...")
+                    remote_function.remote(
+                        video_url=request.video_url,
+                        video_base64=request.video_base64,
+                        batch_size=request.batch_size,
+                        temporal_overlap=request.temporal_overlap,
+                        stitch_mode=request.stitch_mode,
+                        model=request.model,
+                        resolution=request.resolution,
+                        job_id=job_id
+                    )
+                    print(f"[Job {job_id}] .remote() returned (may never happen if container hangs)")
+                except Exception as e:
+                    print(f"[Job {job_id}] .remote() raised exception: {e} (this is OK)")
+
+            remote_thread = threading.Thread(target=call_remote, daemon=True)
+            remote_thread.start()
+
+            # IMMEDIATELY start polling for result file (don't wait for .remote())
+            print(f"[Job {job_id}] Polling for result file in /outputs/results/...")
+
+            max_wait = 7260  # 2 hours + 1 minute buffer
+            start_time = time.time()
             result = None
-            used_fallback = False
+            poll_interval = 10  # Check every 10 seconds
 
-            # PRIMARY PATH: Try to get result from .remote()
-            try:
-                print(f"[Job {job_id}] Calling .remote() (primary path)...")
-
-                result = remote_function.remote(
-                    video_url=request.video_url,
-                    video_base64=request.video_base64,
-                    batch_size=request.batch_size,
-                    temporal_overlap=request.temporal_overlap,
-                    stitch_mode=request.stitch_mode,
-                    model=request.model,
-                    resolution=request.resolution,
-                    job_id=job_id
-                )
-
-                print(f"[Job {job_id}] ✅ Got result from .remote() (fast path)")
-
-                # Validate the result
-                if not result or not isinstance(result, dict):
-                    raise Exception("Invalid result format from .remote()")
-
-                if result.get("status") == "error":
-                    raise Exception(result.get("error", "Unknown error from GPU container"))
-
-                if not result.get("filename"):
-                    raise Exception("Missing filename in result")
-
-            except Exception as e:
-                print(f"[Job {job_id}] ⚠️  PRIMARY PATH FAILED: {e}")
-                print(f"[Job {job_id}] 📂 Switching to FALLBACK PATH (volume read)...")
-
-                # FALLBACK PATH: Read from volume
-                used_fallback = True
-
-                # Wait up to 60 seconds for result file
-                print(f"[Job {job_id}] Polling for result file in volume...")
+            while time.time() - start_time < max_wait:
                 result = read_result_file(job_id)
 
-                if not result:
-                    raise Exception("BOTH paths failed: no result from .remote() AND no result file in volume after 60s")
+                if result:
+                    if result.get("status") == "success":
+                        print(f"[Job {job_id}] ✅ Found success result in volume")
+                        break
+                    elif result.get("status") == "error":
+                        print(f"[Job {job_id}] ❌ Found error result in volume")
+                        raise Exception(result.get("error", "Unknown error from GPU container"))
+                    else:
+                        print(f"[Job {job_id}] ⚠️  Found result with unknown status: {result.get('status')}")
 
-                print(f"[Job {job_id}] ✅ Got result from volume (fallback path)")
+                elapsed = int(time.time() - start_time)
+                if elapsed % 30 == 0:  # Log every 30 seconds
+                    print(f"[Job {job_id}] Still waiting for result file... ({elapsed}s / {max_wait}s)")
 
-                # Check if it's an error result
-                if result.get("status") == "error":
-                    raise Exception(result.get("error", "Unknown error from result file"))
+                time.sleep(poll_interval)
 
-            # Log which path was used
-            if used_fallback:
-                print(f"[Job {job_id}] ⚡ FALLBACK PATH used (container likely hung)")
-            else:
-                print(f"[Job {job_id}] ⚡ PRIMARY PATH used (normal operation)")
+            if not result:
+                raise Exception(f"No result file appeared after {max_wait}s - job likely failed in GPU container")
 
-            # Now we have a valid result (from either source)
+            # Now we have a valid success result
             filename = result["filename"]
 
             # Verify video file actually exists
@@ -683,7 +677,7 @@ def fastapi_app():
             output_volume.reload()
 
             if not os.path.exists(final_path):
-                raise Exception(f"Output video file not found: {final_path}")
+                raise Exception(f"Result file claims success but video file not found: {final_path}")
 
             print(f"[Job {job_id}] ✅ Output video verified: {final_path}")
 
@@ -833,15 +827,17 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "6.0 - HYBRID (Primary: .remote() / Fallback: Volume)",
+            "version": "7.0 - FILE-ONLY (Ignores .remote() return, polls volume only)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
                 "download": "GET /download/{filename}"
             },
             "features": {
-                "hybrid_delivery": "Fast .remote() with volume fallback for 100% reliability",
+                "file_based_delivery": "Completely ignores .remote() return value",
                 "atomic_writes": "Result files written atomically to prevent partial reads",
+                "polling_strategy": "Checks for result file every 10 seconds",
+                "container_hang_proof": "Works even if GPU container hangs during shutdown",
                 "watchdog": "Auto-kills stalled jobs",
                 "real_time_logs": "Live progress updates"
             },
