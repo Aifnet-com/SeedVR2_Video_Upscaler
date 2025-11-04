@@ -52,11 +52,10 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 
 # ---------------- BunnyCDN direct upload (FTPS passive) ----------------
 BUNNY_HOST = "storage.bunnycdn.com"
-BUNNY_PORT = 21
-BUNNY_USER = "aifnet"
-BUNNY_PASS = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"
+BUNNY_USER = "aifnet"  # storage zone name
+BUNNY_PASS = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"  # Storage API/FTP password (AccessKey)
 BUNNY_BASE_URL = "https://aifnet.b-cdn.net"
-BUNNY_ROOT_DIR = "tests/seedvr2_results"
+BUNNY_ROOT_DIR = "tests/seedvr2_results"  # <- your requested directory
 
 def _bunny_makedirs(ftp, path: str):
     """Recursively create directories on Bunny storage (ignore if exist)."""
@@ -72,39 +71,37 @@ def _bunny_makedirs(ftp, path: str):
 
 def upload_to_bunny(local_path: str, remote_rel_path: str) -> str:
     """
-    Upload local file to Bunny storage using FTPS (explicit TLS), passive mode,
-    and return public CDN URL.
+    Upload to Bunny Storage via HTTP PUT with AccessKey header.
+    Returns the CDN URL.
     """
-    from ftplib import FTP_TLS
     import os
+    import requests
 
+    # Ensure path starts with storage zone root, no leading slash
     remote_rel_path = remote_rel_path.lstrip("/")
-    remote_dir = "/".join(remote_rel_path.split("/")[:-1])
-    remote_file = remote_rel_path.split("/")[-1]
+    url = f"https://{BUNNY_HOST}/{remote_rel_path}"
 
-    # Connect FTPS explicit TLS
-    ftps = FTP_TLS()
-    ftps.connect(BUNNY_HOST, BUNNY_PORT, timeout=120)
-    ftps.auth()           # upgrade to TLS
-    ftps.login(BUNNY_USER, BUNNY_PASS)
-    ftps.prot_p()         # protect data channel
-    ftps.set_pasv(True)
+    headers = {
+        "AccessKey": BUNNY_PASS,
+        "Content-Type": "application/octet-stream",
+    }
 
-    # Ensure directories exist
-    if remote_dir:
-        _bunny_makedirs(ftps, remote_dir)
-        ftps.cwd(remote_dir)
+    # simple retry
+    for attempt in range(3):
+        try:
+            with open(local_path, "rb") as f:
+                resp = requests.put(url, headers=headers, data=f, timeout=300)
+            if resp.status_code in (200, 201):
+                return f"{BUNNY_BASE_URL}/{remote_rel_path}"
+            else:
+                print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:200]}")
+        except Exception as e:
+            print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
+        # small backoff
+        import time as _t
+        _t.sleep(2 * (attempt + 1))
 
-    # Upload binary
-    with open(local_path, "rb") as f:
-        ftps.storbinary(f"STOR {remote_file}", f, blocksize=1024 * 256)
-
-    try:
-        ftps.quit()
-    except Exception:
-        ftps.close()
-
-    return f"{BUNNY_BASE_URL}/{remote_rel_path}"
+    raise Exception("Bunny upload failed after 3 attempts")
 
 # ---------------- internal helpers ----------------
 
