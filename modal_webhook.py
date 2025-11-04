@@ -17,10 +17,11 @@ app = modal.App("seedvr2-upscaler")
 # Create a shared dict for real-time progress updates (in-memory, fast)
 progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
 
-# BunnyCDN Configuration
-BUNNYCDN_API_KEY = os.environ.get("BUNNYCDN_API_KEY_VIDEO", "e084a0d7-30a9-49cb-8b355fd4f98a-da03-44cc")
-BUNNYCDN_VIDEO_LIBRARY_ID = os.environ.get("BUNNYCDN_VIDEO_LIBRARY_ID", "131651")
-BUNNYCDN_VIDEO_HOSTNAME = os.environ.get("BUNNYCDN_VIDEO_HOSTNAME", "vz-9a80b184-22d.b-cdn.net")
+# BunnyCDN Storage Configuration (FTP)
+BUNNYCDN_STORAGE_HOSTNAME = "storage.bunnycdn.com"
+BUNNYCDN_STORAGE_USERNAME = "aifnet"
+BUNNYCDN_STORAGE_PASSWORD = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"
+BUNNYCDN_CDN_HOSTNAME = "aifnet.b-cdn.net"
 
 # Define the container image with all dependencies
 image = (
@@ -53,127 +54,56 @@ image = (
 # Create persistent volume for models only
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 
-# BunnyCDN Helper Functions
-def create_bunny_video(title: str) -> Optional[str]:
-    """Create a new video on BunnyCDN and return its GUID"""
-    import requests
-    import time
+# BunnyCDN Storage Helper (FTP)
+def upload_to_bunny_storage(file_path: str, remote_filename: str) -> str:
+    """Upload video to BunnyCDN Storage via FTP - returns immediate CDN URL"""
+    from ftplib import FTP
+    import os
 
-    url = f"https://video.bunnycdn.com/library/{BUNNYCDN_VIDEO_LIBRARY_ID}/videos"
-    data = json.dumps({"title": title})
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "AccessKey": BUNNYCDN_API_KEY
-    }
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    print(f"📤 Uploading {file_size_mb:.2f} MB to BunnyCDN Storage via FTP...")
 
-    for attempt in range(3):
-        try:
-            response = requests.post(url, data=data, headers=headers, timeout=30)
-            response.raise_for_status()
-            response_data = response.json()
-            return response_data.get('guid')
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️  Attempt {attempt + 1}/3 to create video failed: {e}")
-            if attempt == 2:
-                raise Exception(f"Failed to create video on BunnyCDN: {e}")
-            time.sleep(2)
+    try:
+        # Connect to FTP server
+        ftp = FTP(timeout=60)
+        ftp.connect(BUNNYCDN_STORAGE_HOSTNAME, 21)
+        ftp.login(BUNNYCDN_STORAGE_USERNAME, BUNNYCDN_STORAGE_PASSWORD)
+        ftp.set_pasv(True)  # Use passive mode
 
-    return None
+        # Navigate to/create target directory
+        remote_dir = "/tests/seedvr2_results"
+        dirs = remote_dir.strip('/').split('/')
 
+        # Start from root
+        ftp.cwd('/')
 
-def upload_to_bunny(guid: str, file_path: str) -> dict:
-    """Upload video file to BunnyCDN"""
-    import requests
-    import time
+        # Create each directory level if needed
+        for d in dirs:
+            try:
+                ftp.cwd(d)
+            except:
+                try:
+                    ftp.mkd(d)
+                    ftp.cwd(d)
+                except:
+                    pass  # Directory might already exist
 
-    url = f"https://video.bunnycdn.com/library/{BUNNYCDN_VIDEO_LIBRARY_ID}/videos/{guid}"
-    headers = {
-        'AccessKey': BUNNYCDN_API_KEY,
-    }
+        # Upload the file
+        print(f"📤 Uploading {remote_filename}...")
+        with open(file_path, 'rb') as f:
+            ftp.storbinary(f'STOR {remote_filename}', f)
 
-    # Read file content
-    with open(file_path, 'rb') as f:
-        content = f.read()
+        ftp.quit()
 
-    file_size_mb = len(content) / (1024 * 1024)
-    print(f"📤 Uploading {file_size_mb:.2f} MB to BunnyCDN...")
+        print(f"✅ Upload successful!")
 
-    for attempt in range(3):
-        try:
-            response = requests.put(url, data=content, headers=headers, timeout=300)
-            response.raise_for_status()
+        # Return immediate CDN URL (no transcoding needed!)
+        cdn_url = f"https://{BUNNYCDN_CDN_HOSTNAME}/tests/seedvr2_results/{remote_filename}"
+        return cdn_url
 
-            print(f"✅ Upload successful!")
+    except Exception as e:
+        raise Exception(f"FTP upload failed: {e}")
 
-            return {
-                'video_library_id': BUNNYCDN_VIDEO_LIBRARY_ID,
-                'video_guid': guid,
-                'file_size_mb': file_size_mb
-            }
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️  Attempt {attempt + 1}/3 to upload failed: {e}")
-            if attempt == 2:
-                raise Exception(f"Failed to upload to BunnyCDN: {e}")
-            time.sleep(2)
-
-    return None
-
-
-def wait_for_bunny_transcoding(guid: str, resolution: str = "1080p", timeout: int = 180) -> bool:
-    """
-    Wait for BunnyCDN to finish transcoding the video
-    Returns True if transcoding completed, False if timeout
-    """
-    import requests
-    import time
-
-    url = f"https://video.bunnycdn.com/library/{BUNNYCDN_VIDEO_LIBRARY_ID}/videos/{guid}"
-    headers = {
-        "Accept": "application/json",
-        "AccessKey": BUNNYCDN_API_KEY
-    }
-
-    print(f"⏳ Waiting for BunnyCDN transcoding (up to {timeout}s)...")
-    start_time = time.time()
-
-    while time.time() - start_time < timeout:
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            video_data = response.json()
-
-            # BunnyCDN video status codes:
-            # 0 = created, 1 = uploaded, 2 = processing, 3 = encoding, 4 = finished, 5 = failed
-            status = video_data.get('status')
-            status_name = {
-                0: "created",
-                1: "uploaded",
-                2: "processing",
-                3: "encoding",
-                4: "finished",
-                5: "failed"
-            }.get(status, f"unknown({status})")
-
-            elapsed = int(time.time() - start_time)
-
-            if status == 4:  # Finished
-                print(f"✅ Transcoding complete! ({elapsed}s)")
-                return True
-            elif status == 5:  # Failed
-                print(f"❌ Transcoding failed!")
-                return False
-            else:
-                if elapsed % 10 == 0 or elapsed < 10:  # Log every 10 seconds
-                    print(f"⏳ Status: {status_name} ({elapsed}s / {timeout}s)")
-                time.sleep(5)
-
-        except Exception as e:
-            print(f"⚠️  Error checking transcoding status: {e}")
-            time.sleep(5)
-
-    print(f"⚠️  Transcoding timeout after {timeout}s")
-    return False
 
 
 @app.function(
@@ -183,11 +113,6 @@ def wait_for_bunny_transcoding(guid: str, resolution: str = "1080p", timeout: in
     volumes={"/models": model_volume},
     scaledown_window=300,
     max_containers=10,
-    secrets=[modal.Secret.from_dict({
-        "BUNNYCDN_API_KEY_VIDEO": BUNNYCDN_API_KEY,
-        "BUNNYCDN_VIDEO_LIBRARY_ID": BUNNYCDN_VIDEO_LIBRARY_ID,
-        "BUNNYCDN_VIDEO_HOSTNAME": BUNNYCDN_VIDEO_HOSTNAME
-    })]
 )
 def upscale_video_h100(
     video_url: Optional[str] = None,
@@ -213,11 +138,6 @@ def upscale_video_h100(
     volumes={"/models": model_volume},
     scaledown_window=300,
     max_containers=10,
-    secrets=[modal.Secret.from_dict({
-        "BUNNYCDN_API_KEY_VIDEO": BUNNYCDN_API_KEY,
-        "BUNNYCDN_VIDEO_LIBRARY_ID": BUNNYCDN_VIDEO_LIBRARY_ID,
-        "BUNNYCDN_VIDEO_HOSTNAME": BUNNYCDN_VIDEO_HOSTNAME
-    })]
 )
 def upscale_video_h200(
     video_url: Optional[str] = None,
@@ -522,43 +442,12 @@ def _upscale_video_impl(
         # Upload to BunnyCDN instead of Modal volume
         _update_job_progress(job_id, "📤 Uploading to CDN...")
 
-        # Create video title
-        video_title = f"upscaled_{url_hash}_{resolution}_{int(time_module.time())}"
+        # Generate unique filename for FTP storage
+        timestamp = int(time_module.time())
+        filename = f"upscaled_{url_hash}_{resolution}_{timestamp}.mp4"
 
-        # Create video on BunnyCDN
-        print(f"🎬 Creating video on BunnyCDN: {video_title}")
-        guid = create_bunny_video(video_title)
-
-        if not guid:
-            raise Exception("Failed to create video on BunnyCDN")
-
-        print(f"✅ Video created with GUID: {guid}")
-
-        # Upload to BunnyCDN
-        upload_result = upload_to_bunny(guid, temp_output_path)
-
-        if not upload_result:
-            raise Exception("Failed to upload to BunnyCDN")
-
-        # Wait for BunnyCDN to finish transcoding
-        _update_job_progress(job_id, "⏳ Waiting for CDN transcoding...")
-
-        transcoding_success = wait_for_bunny_transcoding(guid, resolution, timeout=180)
-
-        if not transcoding_success:
-            print("⚠️  Transcoding timeout - URL may not work immediately")
-            _update_job_progress(job_id, "⚠️  Transcoding delayed, but video uploaded")
-
-        # Generate CDN URL with proper resolution and hostname
-        # Map our resolution names to BunnyCDN's format
-        resolution_map = {
-            '720p': '720p',
-            '1080p': '1080p',
-            '2k': '1440p',
-            '4k': '2160p'
-        }
-        bunny_resolution = resolution_map.get(resolution, '1080p')
-        cdn_url = f"https://{BUNNYCDN_VIDEO_HOSTNAME}/{guid}/play_{bunny_resolution}.mp4"
+        # Upload via FTP to BunnyCDN Storage (immediate access!)
+        cdn_url = upload_to_bunny_storage(temp_output_path, filename)
 
         print(f"✅ CDN URL: {cdn_url}")
         _update_job_progress(job_id, "✅ Upload complete!")
@@ -569,8 +458,7 @@ def _upscale_video_impl(
 
     return {
         "cdn_url": cdn_url,
-        "video_guid": guid,
-        "video_library_id": BUNNYCDN_VIDEO_LIBRARY_ID,
+        "filename": filename,
         "input_size_mb": input_size_mb,
         "output_size_mb": output_size_mb,
         "resolution": resolution
@@ -636,7 +524,7 @@ def fastapi_app():
         status: str
         progress: Optional[str] = None
         cdn_url: Optional[str] = None
-        video_guid: Optional[str] = None
+        filename: Optional[str] = None
         input_size_mb: Optional[float] = None
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
@@ -688,7 +576,7 @@ def fastapi_app():
                 job_data.update({
                     "status": "completed",
                     "cdn_url": result.get("cdn_url"),
-                    "video_guid": result.get("video_guid"),
+                    "filename": result.get("filename"),
                     "input_size_mb": result.get("input_size_mb", 0),
                     "output_size_mb": result.get("output_size_mb", 0),
                     "progress": "✅ Completed and uploaded to CDN!"
@@ -783,7 +671,7 @@ def fastapi_app():
             status=job_data["status"],
             progress=job_data.get("progress"),
             cdn_url=job_data.get("cdn_url"),
-            video_guid=job_data.get("video_guid"),
+            filename=job_data.get("filename"),
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
             error=job_data.get("error"),
@@ -795,13 +683,13 @@ def fastapi_app():
         """API root"""
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "10.0 - BunnyCDN Direct Upload",
+            "version": "11.0 - BunnyCDN FTP Storage (Immediate Access)",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}"
             },
             "features": {
-                "bunnycdn_upload": "Results uploaded directly to BunnyCDN",
+                "bunnycdn_ftp_storage": "Direct FTP upload to storage - no transcoding!",
                 "no_volume_commits": "No more Modal volume blocking issues",
                 "watchdog": "Auto-kills stalled jobs",
                 "real_time_logs": "Live progress updates",
