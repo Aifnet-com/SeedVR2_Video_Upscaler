@@ -20,6 +20,7 @@ progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
 # BunnyCDN Configuration
 BUNNYCDN_API_KEY = os.environ.get("BUNNYCDN_API_KEY_VIDEO", "e084a0d7-30a9-49cb-8b355fd4f98a-da03-44cc")
 BUNNYCDN_VIDEO_LIBRARY_ID = os.environ.get("BUNNYCDN_VIDEO_LIBRARY_ID", "131651")
+BUNNYCDN_VIDEO_HOSTNAME = os.environ.get("BUNNYCDN_VIDEO_HOSTNAME", "vz-9a80b184-22d.b-cdn.net")
 
 # Define the container image with all dependencies
 image = (
@@ -184,7 +185,8 @@ def wait_for_bunny_transcoding(guid: str, resolution: str = "1080p", timeout: in
     max_containers=10,
     secrets=[modal.Secret.from_dict({
         "BUNNYCDN_API_KEY_VIDEO": BUNNYCDN_API_KEY,
-        "BUNNYCDN_VIDEO_LIBRARY_ID": BUNNYCDN_VIDEO_LIBRARY_ID
+        "BUNNYCDN_VIDEO_LIBRARY_ID": BUNNYCDN_VIDEO_LIBRARY_ID,
+        "BUNNYCDN_VIDEO_HOSTNAME": BUNNYCDN_VIDEO_HOSTNAME
     })]
 )
 def upscale_video_h100(
@@ -213,7 +215,8 @@ def upscale_video_h100(
     max_containers=10,
     secrets=[modal.Secret.from_dict({
         "BUNNYCDN_API_KEY_VIDEO": BUNNYCDN_API_KEY,
-        "BUNNYCDN_VIDEO_LIBRARY_ID": BUNNYCDN_VIDEO_LIBRARY_ID
+        "BUNNYCDN_VIDEO_LIBRARY_ID": BUNNYCDN_VIDEO_LIBRARY_ID,
+        "BUNNYCDN_VIDEO_HOSTNAME": BUNNYCDN_VIDEO_HOSTNAME
     })]
 )
 def upscale_video_h200(
@@ -546,7 +549,7 @@ def _upscale_video_impl(
             print("⚠️  Transcoding timeout - URL may not work immediately")
             _update_job_progress(job_id, "⚠️  Transcoding delayed, but video uploaded")
 
-        # Generate CDN URL with proper resolution
+        # Generate CDN URL with proper resolution and hostname
         # Map our resolution names to BunnyCDN's format
         resolution_map = {
             '720p': '720p',
@@ -555,7 +558,7 @@ def _upscale_video_impl(
             '4k': '2160p'
         }
         bunny_resolution = resolution_map.get(resolution, '1080p')
-        cdn_url = f"https://vz-{BUNNYCDN_VIDEO_LIBRARY_ID}.b-cdn.net/{guid}/play_{bunny_resolution}.mp4"
+        cdn_url = f"https://{BUNNYCDN_VIDEO_HOSTNAME}/{guid}/play_{bunny_resolution}.mp4"
 
         print(f"✅ CDN URL: {cdn_url}")
         _update_job_progress(job_id, "✅ Upload complete!")
