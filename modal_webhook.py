@@ -52,53 +52,45 @@ output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True
 
 # ---------------- BunnyCDN direct upload (FTPS passive) ----------------
 BUNNY_HOST = "storage.bunnycdn.com"
-BUNNY_USER = "aifnet"  # storage zone name
-BUNNY_PASS = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"  # Storage API/FTP password (AccessKey)
+BUNNY_USER = "aifnet"  # <- this is the Storage Zone name
+BUNNY_PASS = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"  # Storage Zone FTP/API password
 BUNNY_BASE_URL = "https://aifnet.b-cdn.net"
-BUNNY_ROOT_DIR = "tests/seedvr2_results"  # <- your requested directory
-
-def _bunny_makedirs(ftp, path: str):
-    """Recursively create directories on Bunny storage (ignore if exist)."""
-    parts = [p for p in path.strip("/").split("/") if p]
-    cur = ""
-    for p in parts:
-        cur = f"{cur}/{p}" if cur else p
-        try:
-            ftp.mkd(cur)
-        except Exception:
-            # If exists, it's fine
-            pass
+BUNNY_ROOT_DIR = "tests/seedvr2_results"  # your desired folder under the zone
 
 def upload_to_bunny(local_path: str, remote_rel_path: str) -> str:
     """
-    Upload to Bunny Storage via HTTP PUT with AccessKey header.
-    Returns the CDN URL.
+    Upload to Bunny Storage via HTTPS PUT with AccessKey header.
+    remote_rel_path is the path UNDER the storage zone (no leading slash).
+    Returns the CDN URL (which does NOT include the zone segment).
     """
     import os
     import requests
+    import time as _t
 
-    # Ensure path starts with storage zone root, no leading slash
-    remote_rel_path = remote_rel_path.lstrip("/")
-    url = f"https://{BUNNY_HOST}/{remote_rel_path}"
+    # normalize
+    remote_rel_path = remote_rel_path.lstrip("/")  # e.g. "tests/seedvr2_results/foo.mp4"
+
+    # ✅ IMPORTANT: include the storage zone in the URL path
+    # final upload URL: https://storage.bunnycdn.com/<ZONE>/<remote_rel_path>
+    url = f"https://{BUNNY_HOST}/{BUNNY_USER}/{remote_rel_path}"
 
     headers = {
-        "AccessKey": BUNNY_PASS,
+        "AccessKey": BUNNY_PASS,                 # Storage Zone password
         "Content-Type": "application/octet-stream",
+        "Connection": "close",                   # helps avoid lingering TLS issues
     }
 
-    # simple retry
     for attempt in range(3):
         try:
             with open(local_path, "rb") as f:
                 resp = requests.put(url, headers=headers, data=f, timeout=300)
             if resp.status_code in (200, 201):
+                # CDN path does NOT include the zone name
                 return f"{BUNNY_BASE_URL}/{remote_rel_path}"
             else:
                 print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:200]}")
         except Exception as e:
             print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
-        # small backoff
-        import time as _t
         _t.sleep(2 * (attempt + 1))
 
     raise Exception("Bunny upload failed after 3 attempts")
