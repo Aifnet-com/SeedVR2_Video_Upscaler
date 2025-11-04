@@ -71,6 +71,65 @@ def schedule_volume_commit(volume, wait_seconds: int = 12):
         if t.is_alive():
             print(f"⏱️ Volume commit still in progress after {wait_seconds}s; continuing without waiting...")
 # ---------------------------------------------------------------------------
+
+# ---- Atomic JSON helpers (avoid partial reads across containers) -----------
+import tempfile, time, errno
+
+def _fsync_dir(dir_path: str):
+    try:
+        fd = os.open(dir_path, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception as e:
+        print(f"ℹ️  Skipping dir fsync for {dir_path}: {e}")
+
+def atomic_json_write(target_path: str, data: dict):
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    dir_path = os.path.dirname(target_path)
+    # Write to a unique temp file in the same directory
+    with tempfile.NamedTemporaryFile('w', dir=dir_path, delete=False) as tmp:
+        tmp_path = tmp.name
+        json.dump(data, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    # Atomically replace
+    os.replace(tmp_path, target_path)
+    # Fsync the directory entry to persist rename
+    _fsync_dir(dir_path)
+
+def robust_json_load(path: str, volume=None, retries: int = 6, backoff: float = 0.25):
+    last_err = None
+    for i in range(retries):
+        try:
+            # Optional reload to pick fresh view if provided
+            if volume is not None and i > 0:
+                try:
+                    volume.reload()
+                except Exception as re:
+                    print(f"⚠️ volume.reload() failed on retry {i}: {re}")
+            # Ensure file exists and is non-empty
+            if not os.path.exists(path):
+                last_err = FileNotFoundError(path)
+                time.sleep(backoff * (i + 1))
+                continue
+            if os.path.getsize(path) == 0:
+                last_err = EOFError("empty file")
+                time.sleep(backoff * (i + 1))
+                continue
+            with open(path, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            last_err = e
+            time.sleep(backoff * (i + 1))
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff * (i + 1))
+    # Give up with last error
+    if last_err:
+        raise last_err
+# ---------------------------------------------------------------------------
 @app.function(
     image=image,
     gpu="H100",
@@ -524,8 +583,8 @@ def fastapi_app():
 
     def save_job(job_id: str, job_data: dict):
         """Save job to persistent storage"""
-        with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
-            json.dump(job_data, f)
+        target = f"{JOBS_DIR}/{job_id}.json"
+        atomic_json_write(target, job_data)
         schedule_volume_commit(output_volume, wait_seconds=12)
 
     def load_job(job_id: str) -> Optional[dict]:
