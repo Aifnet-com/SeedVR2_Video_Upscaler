@@ -135,7 +135,7 @@ def robust_json_load(path: str, volume=None, retries: int = 6, backoff: float = 
 
 # ---------- Shared job storage utilities (top-level, used by web & workers) ----------
 JOBS_DIR = "/outputs/jobs"
-os.makedirs(JOBS_DIR, exist_ok=True)
+# os.makedirs(JOBS_DIR, exist_ok=True)
 
 from pydantic import BaseModel
 
@@ -542,10 +542,10 @@ def upscale_video_h200(
     scaledown_window=60,
 )
 def run_job(job_id: str, request_dict: dict):
-    """
-    Dedicated job runner: executes the existing process_video() in a separate worker.
-    This keeps the FastAPI container free of long-running tasks.
-    """
+    try:
+        os.makedirs(JOBS_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"ℹ️ jobs dir ensure skipped: {e}")
     req = UpscaleRequest(**request_dict)
     process_video(job_id, req)
 
@@ -651,6 +651,12 @@ def fastapi_app():
     from fastapi.responses import FileResponse
 
     web_app = FastAPI()
+
+    # ✅ Safe at runtime: /outputs is mounted now
+    try:
+        os.makedirs(JOBS_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"ℹ️ jobs dir ensure skipped: {e}")
 
     @web_app.post("/upscale")
     async def upscale_endpoint(request: UpscaleRequest):
