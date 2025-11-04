@@ -45,6 +45,9 @@ image = (
         "requests>=2.32.3",
         "fastapi[standard]"
     )
+    .run_commands(
+        "cd /root && git clone https://github.com/Aifnet-com/SeedVR2_Video_Upscaler.git ComfyUI-SeedVR2_VideoUpscaler"
+    )
 )
 
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
@@ -292,16 +295,51 @@ def _upscale_video_impl(
             input_size_mb = calculate_file_size_mb(input_path)
             log_progress(f"📊 Input video: {input_size_mb:.2f} MB")
 
-            # Resolution mapping
-            resolution_map = {
-                '720p': (1280, 720),
-                '1080p': (1920, 1080),
-                '2k': (2560, 1440),
-                '4k': (3840, 2160)
+            # Get video dimensions and duration using cv2
+            log_progress("📐 Analyzing video dimensions...")
+            import cv2
+            import math
+
+            cap = cv2.VideoCapture(input_path)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_duration = frame_count / fps if fps > 0 else 30
+            cap.release()
+
+            if width == 0 or height == 0:
+                raise Exception(f"Could not read video dimensions: {width}x{height}")
+
+            log_progress(f"📐 Input dimensions: {width}x{height}")
+            log_progress(f"⏱️  Video: {video_duration:.1f}s ({frame_count} frames @ {fps:.2f} fps)")
+
+            # Calculate target resolution based on input dimensions
+            target_pixels_map = {
+                '720p': 921600,   # 1280x720
+                '1080p': 2073600, # 1920x1080
+                '2k': 3686400,    # 2560x1440
+                '4k': 8294400,    # 3840x2160
             }
 
-            target_width, target_height = resolution_map.get(resolution, (1920, 1080))
-            log_progress(f"🎯 Target resolution: {resolution} ({target_width}x{target_height})")
+            target_pixels = target_pixels_map.get(resolution, 2073600)
+
+            # Initial scale based on target pixel count
+            ratio = math.sqrt(target_pixels / (width * height))
+            new_width = width * ratio
+            new_height = height * ratio
+
+            # Round BOTH dimensions to nearest multiple of 16
+            new_width = round(new_width / 16) * 16
+            new_height = round(new_height / 16) * 16
+
+            # Use minimum side (short side) as resolution parameter
+            resolution_px = int(min(new_width, new_height))
+
+            log_progress(f"📐 Calculated output: {int(new_width)}x{int(new_height)} (resolution={resolution_px}px)")
+            log_progress(f"   Target pixels: {target_pixels:,}")
+            actual_pixels = int(new_width * new_height)
+            log_progress(f"   Actual pixels: {actual_pixels:,} ({((actual_pixels / target_pixels - 1) * 100):+.1f}%)")
 
             # Run upscaling with watchdog
             output_path = f"{temp_dir}/upscaled.mp4"
@@ -310,15 +348,16 @@ def _upscale_video_impl(
             stall_timeout = _calculate_stall_timeout(resolution, batch_size)
 
             cmd = [
-                "python", "-u", "/root/ComfyUI-SeedVR2_VideoUpscaler/seedvr2_upscaler.py",
-                "--input", input_path,
-                "--output", output_path,
-                "--model_path", model_path,
+                "python", "-u", "/root/ComfyUI-SeedVR2_VideoUpscaler/inference_cli.py",
+                "--video_path", input_path,
                 "--batch_size", str(batch_size),
                 "--temporal_overlap", str(temporal_overlap),
                 "--stitch_mode", stitch_mode,
-                "--target_width", str(target_width),
-                "--target_height", str(target_height)
+                "--model", model,
+                "--resolution", str(resolution_px),
+                "--model_dir", "/models",
+                "--output", output_path,
+                "--debug"
             ]
 
             log_progress(f"⚙️  Processing with batch_size={batch_size}, overlap={temporal_overlap}")
@@ -439,13 +478,13 @@ def fastapi_app():
         try:
             job_file = f"{JOBS_DIR}/{job_id}.json"
             temp_file = f"{JOBS_DIR}/{job_id}.tmp"
-
+            
             # Write to temp file first
             with open(temp_file, "w") as f:
                 json.dump(job_data, f)
                 f.flush()
                 os.fsync(f.fileno())
-
+            
             # Atomic rename
             os.rename(temp_file, job_file)
             output_volume.commit()
@@ -461,17 +500,17 @@ def fastapi_app():
     def load_job(job_id: str) -> Optional[dict]:
         """Load job from persistent storage with error handling"""
         job_file = f"{JOBS_DIR}/{job_id}.json"
-
+        
         try:
             if not os.path.exists(job_file):
                 output_volume.reload()
-
+            
             if not os.path.exists(job_file):
                 return None
-
+            
             with open(job_file, "r") as f:
                 return json.load(f)
-
+                
         except (IOError, OSError) as e:
             # File might be locked by another container
             print(f"⚠️  Could not read job {job_id}: {e}")
