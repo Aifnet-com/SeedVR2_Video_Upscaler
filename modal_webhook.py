@@ -416,8 +416,8 @@ def _upscale_video_impl(
     image=image,
     scaledown_window=300,
     volumes={"/outputs": output_volume},
-    allow_concurrent_inputs=100,
 )
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def fastapi_app():
     """FastAPI webhook for job submission and status checking"""
