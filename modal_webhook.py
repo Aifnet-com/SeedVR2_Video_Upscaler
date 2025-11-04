@@ -6,8 +6,9 @@ Includes WATCHDOG to detect and kill stalled processes
 
 import modal
 from typing import Dict, Optional
-import json
 from base64 import b64decode
+import os
+import json
 
 # Create Modal app
 app = modal.App("seedvr2-upscaler")
@@ -73,7 +74,7 @@ def schedule_volume_commit(volume, wait_seconds: int = 12):
 # ---------------------------------------------------------------------------
 
 # ---- Atomic JSON helpers (avoid partial reads across containers) -----------
-import tempfile, time, errno
+import os, json, tempfile, time
 
 def _fsync_dir(dir_path: str):
     try:
