@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# SeedVR2 Video Upscaler - Simple CLI wrapper
-# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 720p|1080p]
+# SeedVR2 Video Upscaler - Simple CLI wrapper (BunnyCDN version)
+# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 720p|1080p|2k|4k]
 
 if [ -z "$1" ]; then
     echo "Usage: $0 <video_url> [--resolution 720p|1080p|2k|4k]"
@@ -82,20 +82,29 @@ while true; do
         printf "\r\033[K"
         echo ""
         echo "✅ Job completed!"
-        DOWNLOAD_URL=$(echo $STATUS | jq -r '.download_url')
+        
+        # Get CDN URL (new field)
+        CDN_URL=$(echo $STATUS | jq -r '.cdn_url')
         OUTPUT_SIZE=$(echo $STATUS | jq -r '.output_size_mb')
+        VIDEO_GUID=$(echo $STATUS | jq -r '.video_guid')
+        
         echo "📊 Output: ${OUTPUT_SIZE} MB"
+        echo "🌐 Video GUID: ${VIDEO_GUID}"
+        echo "🔗 CDN URL: ${CDN_URL}"
         echo ""
 
-        echo "📥 Downloading..."
-        curl -s "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
+        echo "📥 Downloading from CDN..."
+        curl -s "$CDN_URL" -o "$OUTPUT_FILE"
 
         if [ -f "$OUTPUT_FILE" ]; then
             FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
             echo "✅ Saved to: $OUTPUT_FILE ($FILE_SIZE)"
             echo "⏱️  Total time: ${ELAPSED} seconds"
+            echo ""
+            echo "💡 You can also access the video at: ${CDN_URL}"
         else
             echo "❌ Download failed"
+            echo "💡 But the video is still available at: ${CDN_URL}"
             exit 1
         fi
         break
