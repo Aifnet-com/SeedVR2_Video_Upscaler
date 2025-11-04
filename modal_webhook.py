@@ -59,50 +59,82 @@ def upload_to_bunny_storage(file_path: str, remote_filename: str) -> str:
     """Upload video to BunnyCDN Storage via FTP - returns immediate CDN URL"""
     from ftplib import FTP
     import os
-
+    
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     print(f"📤 Uploading {file_size_mb:.2f} MB to BunnyCDN Storage via FTP...")
-
+    
     try:
         # Connect to FTP server
         ftp = FTP(timeout=60)
         ftp.connect(BUNNYCDN_STORAGE_HOSTNAME, 21)
         ftp.login(BUNNYCDN_STORAGE_USERNAME, BUNNYCDN_STORAGE_PASSWORD)
         ftp.set_pasv(True)  # Use passive mode
-
+        
         # Navigate to/create target directory
         remote_dir = "/tests/seedvr2_results"
         dirs = remote_dir.strip('/').split('/')
-
-        # Start from root
-        ftp.cwd('/')
-
+        
+        print(f"📁 Current directory: {ftp.pwd()}")
+        print(f"📁 Navigating to {remote_dir}")
+        
         # Create each directory level if needed
         for d in dirs:
             try:
                 ftp.cwd(d)
-            except:
+                print(f"  ✓ Entered /{d}")
+            except Exception as dir_err:
+                # Directory doesn't exist, try to create it
+                print(f"  📁 Creating /{d}")
                 try:
                     ftp.mkd(d)
                     ftp.cwd(d)
-                except:
-                    pass  # Directory might already exist
-
+                    print(f"  ✓ Created and entered /{d}")
+                except Exception as mk_err:
+                    print(f"  ⚠️  Error with {d}: {mk_err}")
+                    # List available directories for debugging
+                    try:
+                        print(f"  📂 Available: {ftp.nlst()}")
+                    except:
+                        pass
+                    raise Exception(f"Cannot create/access directory {d}: {mk_err}")
+        
+        print(f"✅ In target directory: {ftp.pwd()}")
+        
         # Upload the file
         print(f"📤 Uploading {remote_filename}...")
         with open(file_path, 'rb') as f:
             ftp.storbinary(f'STOR {remote_filename}', f)
-
+        
         ftp.quit()
-
+        
         print(f"✅ Upload successful!")
-
+        
         # Return immediate CDN URL (no transcoding needed!)
         cdn_url = f"https://{BUNNYCDN_CDN_HOSTNAME}/tests/seedvr2_results/{remote_filename}"
         return cdn_url
-
+        
     except Exception as e:
-        raise Exception(f"FTP upload failed: {e}")
+        # Fallback: try uploading to root directory if subdirectories don't work
+        try:
+            print(f"⚠️  Subdirectory upload failed, trying root directory...")
+            ftp2 = FTP(timeout=60)
+            ftp2.connect(BUNNYCDN_STORAGE_HOSTNAME, 21)
+            ftp2.login(BUNNYCDN_STORAGE_USERNAME, BUNNYCDN_STORAGE_PASSWORD)
+            ftp2.set_pasv(True)
+            
+            print(f"📤 Uploading {remote_filename} to root...")
+            with open(file_path, 'rb') as f:
+                ftp2.storbinary(f'STOR {remote_filename}', f)
+            
+            ftp2.quit()
+            print(f"✅ Upload successful to root!")
+            
+            # Return CDN URL from root
+            cdn_url = f"https://{BUNNYCDN_CDN_HOSTNAME}/{remote_filename}"
+            return cdn_url
+            
+        except Exception as e2:
+            raise Exception(f"FTP upload failed (both subdirectory and root): {e}, {e2}")
 
 
 
