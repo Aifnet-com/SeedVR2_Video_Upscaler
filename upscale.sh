@@ -94,7 +94,21 @@ while true; do
         echo ""
 
         echo "📥 Downloading from CDN..."
-        curl -s "$CDN_URL" -o "$OUTPUT_FILE"
+
+        # Retry download a few times in case transcoding just finished
+        for i in {1..3}; do
+            curl -s "$CDN_URL" -o "$OUTPUT_FILE"
+
+            if [ -f "$OUTPUT_FILE" ] && [ $(stat -f%z "$OUTPUT_FILE" 2>/dev/null || stat -c%s "$OUTPUT_FILE" 2>/dev/null) -gt 100000 ]; then
+                # File exists and is larger than 100KB (not an error page)
+                break
+            else
+                if [ $i -lt 3 ]; then
+                    echo "⏳ Waiting for CDN (attempt $i/3)..."
+                    sleep 10
+                fi
+            fi
+        done
 
         if [ -f "$OUTPUT_FILE" ]; then
             FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
@@ -119,7 +133,7 @@ while true; do
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
-        
+
         # Clear line, then print status (all in one printf to avoid flicker)
         printf "\r\033[K⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
     fi

@@ -119,6 +119,62 @@ def upload_to_bunny(guid: str, file_path: str) -> dict:
     return None
 
 
+def wait_for_bunny_transcoding(guid: str, resolution: str = "1080p", timeout: int = 180) -> bool:
+    """
+    Wait for BunnyCDN to finish transcoding the video
+    Returns True if transcoding completed, False if timeout
+    """
+    import requests
+    import time
+
+    url = f"https://video.bunnycdn.com/library/{BUNNYCDN_VIDEO_LIBRARY_ID}/videos/{guid}"
+    headers = {
+        "Accept": "application/json",
+        "AccessKey": BUNNYCDN_API_KEY
+    }
+
+    print(f"⏳ Waiting for BunnyCDN transcoding (up to {timeout}s)...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            video_data = response.json()
+
+            # BunnyCDN video status codes:
+            # 0 = created, 1 = uploaded, 2 = processing, 3 = encoding, 4 = finished, 5 = failed
+            status = video_data.get('status')
+            status_name = {
+                0: "created",
+                1: "uploaded",
+                2: "processing",
+                3: "encoding",
+                4: "finished",
+                5: "failed"
+            }.get(status, f"unknown({status})")
+
+            elapsed = int(time.time() - start_time)
+
+            if status == 4:  # Finished
+                print(f"✅ Transcoding complete! ({elapsed}s)")
+                return True
+            elif status == 5:  # Failed
+                print(f"❌ Transcoding failed!")
+                return False
+            else:
+                if elapsed % 10 == 0 or elapsed < 10:  # Log every 10 seconds
+                    print(f"⏳ Status: {status_name} ({elapsed}s / {timeout}s)")
+                time.sleep(5)
+
+        except Exception as e:
+            print(f"⚠️  Error checking transcoding status: {e}")
+            time.sleep(5)
+
+    print(f"⚠️  Transcoding timeout after {timeout}s")
+    return False
+
+
 @app.function(
     image=image,
     gpu="H100",
@@ -481,8 +537,25 @@ def _upscale_video_impl(
         if not upload_result:
             raise Exception("Failed to upload to BunnyCDN")
 
-        # Generate CDN URL
-        cdn_url = f"https://vz-{BUNNYCDN_VIDEO_LIBRARY_ID}.b-cdn.net/{guid}/play_1080p.mp4"
+        # Wait for BunnyCDN to finish transcoding
+        _update_job_progress(job_id, "⏳ Waiting for CDN transcoding...")
+
+        transcoding_success = wait_for_bunny_transcoding(guid, resolution, timeout=180)
+
+        if not transcoding_success:
+            print("⚠️  Transcoding timeout - URL may not work immediately")
+            _update_job_progress(job_id, "⚠️  Transcoding delayed, but video uploaded")
+
+        # Generate CDN URL with proper resolution
+        # Map our resolution names to BunnyCDN's format
+        resolution_map = {
+            '720p': '720p',
+            '1080p': '1080p',
+            '2k': '1440p',
+            '4k': '2160p'
+        }
+        bunny_resolution = resolution_map.get(resolution, '1080p')
+        cdn_url = f"https://vz-{BUNNYCDN_VIDEO_LIBRARY_ID}.b-cdn.net/{guid}/play_{bunny_resolution}.mp4"
 
         print(f"✅ CDN URL: {cdn_url}")
         _update_job_progress(job_id, "✅ Upload complete!")
