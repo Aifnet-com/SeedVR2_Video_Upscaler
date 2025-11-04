@@ -1,28 +1,41 @@
 #!/bin/bash
 
 # SeedVR2 Video Upscaler - Simple CLI wrapper
-# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 720p|1080p|2k|4k]
+# Usage: ./upscale.sh "https://example.com/video.mp4" [--resolution 720p|1080p|2k|4k] [--open]
 
 if [ -z "$1" ]; then
-    echo "Usage: $0 <video_url> [--resolution 720p|1080p|2k|4k]"
+    echo "Usage: $0 <video_url> [--resolution 720p|1080p|2k|4k] [--open]"
     echo "Example: $0 'https://astra.app/api/files/xxx.mp4'"
     echo "Example: $0 'https://astra.app/api/files/xxx.mp4' --resolution 720p"
-    echo "Example: $0 'https://astra.app/api/files/xxx.mp4' --resolution 4k"
+    echo "Example: $0 'https://astra.app/api/files/xxx.mp4' --resolution 4k --open"
     exit 1
 fi
 
 VIDEO_URL="$1"
 API_URL="https://aifnet--seedvr2-upscaler-fastapi-app.modal.run"
 RESOLUTION="1080p"
+AUTO_OPEN=false
 
-# Parse optional resolution argument
-if [ "$2" = "--resolution" ] && [ -n "$3" ]; then
-    if [[ "$3" =~ ^(720p|1080p|2k|4k)$ ]]; then
-        RESOLUTION="$3"
-    else
-        echo "❌ Invalid resolution: $3. Must be 720p, 1080p, 2k, or 4k"
-        exit 1
-    fi
+# Parse optional arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --resolution)
+            RESOLUTION="$2"
+            shift 2
+            ;;
+        --open)
+            AUTO_OPEN=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [[ ! "$RESOLUTION" =~ ^(720p|1080p|2k|4k)$ ]]; then
+    echo "❌ Invalid resolution: $RESOLUTION. Must be 720p, 1080p, 2k, or 4k"
+    exit 1
 fi
 
 echo "🚀 Submitting upscaling job..."
@@ -95,7 +108,6 @@ while true; do
 
         echo "📥 Downloading..."
         echo "🔗 $DOWNLOAD_URL"
-        # Robust download (follow redirects, fail on HTTP error, retry a bit)
         curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
           "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
 
@@ -104,6 +116,24 @@ while true; do
             echo "✅ Saved to: $OUTPUT_FILE ($FILE_SIZE)"
             echo "⏱️  Total time: ${ELAPSED} seconds"
             echo "Upscaled_url: $DOWNLOAD_URL"
+
+            # Clickable hyperlink for modern terminals (VS Code, iTerm2, etc.)
+            printf "\033]8;;%s\033\\Open in browser\033]8;;\033\\\n" "$DOWNLOAD_URL"
+
+            # Auto-open browser if requested
+            if [ "$AUTO_OPEN" = true ] || [ "$UPSCALE_OPEN" = "1" ]; then
+                if command -v xdg-open >/dev/null 2>&1; then
+                    xdg-open "$DOWNLOAD_URL" >/dev/null 2>&1 &
+                elif command -v open >/dev/null 2>&1; then
+                    open "$DOWNLOAD_URL" >/dev/null 2>&1 &
+                elif command -v wslview >/dev/null 2>&1; then
+                    wslview "$DOWNLOAD_URL" >/dev/null 2>&1 &
+                elif command -v start >/dev/null 2>&1; then
+                    start "" "$DOWNLOAD_URL" >/dev/null 2>&1 &
+                else
+                    echo "ℹ️  Could not auto-open (no xdg-open/open/wslview/start). Copy the URL above."
+                fi
+            fi
         else
             echo "❌ Download failed"
             exit 1
