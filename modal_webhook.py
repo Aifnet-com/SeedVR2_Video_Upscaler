@@ -221,7 +221,6 @@ def _upscale_video_impl(
         )
 
         lines = []
-        last_heartbeat = time as time_module
         last_heartbeat = time_module.time()
         stalled_kill = False
         is_first_batch = True
