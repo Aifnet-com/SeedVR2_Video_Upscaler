@@ -1,24 +1,22 @@
 """
-Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
-Supports both URL and local file inputs with REAL-TIME LOG STREAMING via Modal Dict
-Includes WATCHDOG to detect and kill stalled processes
-
-This version uploads final MP4s directly to BunnyCDN Storage (FTPS passive)
-and returns the CDN URL, avoiding Modal volume commit() entirely.
+Async Modal deployment for SeedVR2 Video Upscaler
+- Real-time progress via Modal Dict
+- Watchdog to kill stalled runs
+- H100 for 720p/1080p, H200 for 2K/4K
+- Final artifact uploaded to Bunny Video Library (Stream) via HTTPS
+- Status returns a playable EMBED URL (no Modal volume commits)
 """
 
 import modal
-from typing import Dict, Optional
+from typing import Optional
 import json
-from base64 import b64decode
 
-# Create Modal app
+# ---------------- Modal app & shared state ----------------
+
 app = modal.App("seedvr2-upscaler")
-
-# In-memory progress (shared dict)
 progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
 
-# Image / deps
+# Base image & deps
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
@@ -26,7 +24,7 @@ image = (
         "torch==2.5.1",
         "torchvision==0.20.1",
         "torchaudio==2.5.1",
-        index_url="https://download.pytorch.org/whl/cu121"
+        index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
         "opencv-python-headless==4.10.0.84",
@@ -42,60 +40,64 @@ image = (
         "accelerate>=1.1.1",
         "huggingface-hub>=0.26.2",
         "requests>=2.32.3",
-        "fastapi[standard]"
+        "fastapi[standard]",
     )
 )
 
-# Volumes (models still use volume; outputs mounted but we DO NOT commit)
+# Models volume only (we do NOT rely on outputs volume for final files anymore)
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
-output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True)
 
-# ---------------- BunnyCDN direct upload (FTPS passive) ----------------
-BUNNY_HOST = "storage.bunnycdn.com"
-BUNNY_USER = "aifnet"  # <- this is the Storage Zone name
-BUNNY_PASS = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"  # Storage Zone FTP/API password
-BUNNY_BASE_URL = "https://aifnet.b-cdn.net"
-BUNNY_ROOT_DIR = "tests/seedvr2_results"  # your desired folder under the zone
+# ---------------- Bunny Video Library (Stream) constants ----------------
 
-def upload_to_bunny(local_path: str, remote_rel_path: str) -> str:
-    """
-    Upload to Bunny Storage via HTTPS PUT with AccessKey header.
-    remote_rel_path is the path UNDER the storage zone (no leading slash).
-    Returns the CDN URL (which does NOT include the zone segment).
-    """
-    import os
-    import requests
-    import time as _t
+# Provided by you:
+BUNNY_VIDEO_API_KEY = "e084a0d7-30a9-49cb-8b355fd4f98a-da03-44cc"
+BUNNY_VIDEO_LIBRARY_ID = "131651"
 
-    # normalize
-    remote_rel_path = remote_rel_path.lstrip("/")  # e.g. "tests/seedvr2_results/foo.mp4"
-
-    # ✅ IMPORTANT: include the storage zone in the URL path
-    # final upload URL: https://storage.bunnycdn.com/<ZONE>/<remote_rel_path>
-    url = f"https://{BUNNY_HOST}/{BUNNY_USER}/{remote_rel_path}"
-
+def bunny_create_video(title: str) -> str:
+    """Create a video placeholder in Bunny Video Library. Returns GUID."""
+    import requests, time
+    url = f"https://video.bunnycdn.com/library/{BUNNY_VIDEO_LIBRARY_ID}/videos"
     headers = {
-        "AccessKey": BUNNY_PASS,                 # Storage Zone password
-        "Content-Type": "application/octet-stream",
-        "Connection": "close",                   # helps avoid lingering TLS issues
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "AccessKey": BUNNY_VIDEO_API_KEY,
     }
-
+    data = {"title": title}
     for attempt in range(3):
         try:
-            with open(local_path, "rb") as f:
-                resp = requests.put(url, headers=headers, data=f, timeout=300)
-            if resp.status_code in (200, 201):
-                # CDN path does NOT include the zone name
-                return f"{BUNNY_BASE_URL}/{remote_rel_path}"
-            else:
-                print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:200]}")
-        except Exception as e:
-            print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
-        _t.sleep(2 * (attempt + 1))
+            r = requests.post(url, json=data, headers=headers, timeout=60)
+            r.raise_for_status()
+            return r.json().get("guid")
+        except requests.RequestException as e:
+            if attempt == 2:
+                raise
+            time.sleep(1 + attempt)
 
-    raise Exception("Bunny upload failed after 3 attempts")
+def bunny_upload_video_file(guid: str, file_path: str):
+    """Upload the MP4 bytes to Bunny Video Library (streaming PUT)."""
+    import requests, time
+    url = f"https://video.bunnycdn.com/library/{BUNNY_VIDEO_LIBRARY_ID}/videos/{guid}"
+    headers = {"AccessKey": BUNNY_VIDEO_API_KEY}
+    with open(file_path, "rb") as f:
+        for attempt in range(3):
+            try:
+                r = requests.put(url, data=f, headers=headers, timeout=600)
+                if r.status_code in (200, 201):
+                    return
+                # retry
+                f.seek(0)
+            except requests.RequestException:
+                f.seek(0)
+            if attempt == 2:
+                break
+            time.sleep(1 + attempt)
+    raise Exception("Bunny video upload failed after 3 attempts")
 
-# ---------------- internal helpers ----------------
+def bunny_embed_url(guid: str) -> str:
+    """Return an embeddable player URL that is available immediately."""
+    return f"https://iframe.mediadelivery.net/embed/{BUNNY_VIDEO_LIBRARY_ID}/{guid}"
+
+# ---------------- Utility: progress + timeout heuristics ----------------
 
 def _update_job_progress(job_id: str, progress_text: str):
     """Update progress in shared dict (fast path)."""
@@ -107,17 +109,19 @@ def _update_job_progress(job_id: str, progress_text: str):
     except Exception as e:
         print(f"⚠️ progress_dict update failed: {e}")
 
-def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frames: int = None) -> int:
+def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
     """
     Timeout must exceed per-batch processing time (we only log between batches).
     Empirical seconds per 100 frames:
-    720p ~50, 1080p ~70, 2k ~120, 4k ~250.
+      720p ~50, 1080p ~70, 2k ~120, 4k ~250.
     """
-    time_per_100_frames = {'720p': 50, '1080p': 70, '2k': 120, '4k': 250}
+    time_per_100_frames = {"720p": 50, "1080p": 70, "2k": 120, "4k": 250}
     base = time_per_100_frames.get(resolution, 62)
     expected_batch = int(base * (batch_size / 100))
     first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)  # add model load + slack
     return first_batch_timeout
+
+# ---------------- Core upscaler implementation ----------------
 
 def _upscale_video_impl(
     video_url: Optional[str] = None,
@@ -128,9 +132,12 @@ def _upscale_video_impl(
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
     gpu_type: str = "H100",
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
 ):
-    """Do the actual upscaling and upload final MP4 to BunnyCDN."""
+    """
+    Run SeedVR2, then upload the resulting MP4 to Bunny Video Library.
+    Returns filename, sizes, and the embed URL (cdn_url).
+    """
     import subprocess, tempfile, os, requests, hashlib, time as time_module
     import shutil, cv2, math, threading, signal
 
@@ -155,7 +162,7 @@ def _upscale_video_impl(
         input_path = os.path.join(tmpdir, "input.mp4")
         output_tmp = os.path.join(tmpdir, "output.mp4")
 
-        # Input
+        # Input fetch/prepare
         if video_url:
             _update_job_progress(job_id, "📥 Downloading video...")
             r = requests.get(video_url, stream=True, timeout=300)
@@ -181,22 +188,22 @@ def _upscale_video_impl(
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
-        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
         if w == 0 or h == 0:
             raise Exception(f"Could not read input dimensions ({w}x{h})")
 
         # Timeouts
-        stall_timeout = _calculate_stall_timeout(resolution, batch_size, frames)
+        stall_timeout = _calculate_stall_timeout(resolution, batch_size)
 
         # Target dims by pixel budget (rounded to /16)
-        target_pixels_map = {'720p': 921600, '1080p': 2073600, '2k': 3686400, '4k': 8294400}
+        target_pixels_map = {"720p": 921600, "1080p": 2073600, "2k": 3686400, "4k": 8294400}
         tgt = target_pixels_map.get(resolution, 2073600)
         ratio = math.sqrt(tgt / (w * h))
         out_w = round((w * ratio) / 16) * 16
         out_h = round((h * ratio) / 16) * 16
         res_px = min(out_w, out_h)
 
+        # Build CLI
         cmd = [
             "python", "inference_cli.py",
             "--video_path", input_path,
@@ -286,34 +293,37 @@ def _upscale_video_impl(
             raise Exception("Output file not created")
 
         output_size_mb = os.path.getsize(output_tmp) / (1024 * 1024)
-        _update_job_progress(job_id, "✅ Finalizing output...")
+        _update_job_progress(job_id, "✅ Uploading to Bunny...")
 
-        # ---------------- Upload to Bunny, not to /outputs ----------------
+        # -------- Upload to Bunny Video Library --------
         timestamp = int(time_module.time())
-        filename = f"{url_hash}_{resolution}_{timestamp}.mp4"
-        remote_rel_path = f"{BUNNY_ROOT_DIR}/{filename}"
-        cdn_url = upload_to_bunny(output_tmp, remote_rel_path)
-        print(f"✅ Uploaded to Bunny: {cdn_url}")
+        title = f"{url_hash}_{resolution}_{timestamp}"
+        guid = bunny_create_video(title)          # 1) create record
+        bunny_upload_video_file(guid, output_tmp) # 2) upload bytes
+        cdn_url = bunny_embed_url(guid)           # ready-to-use player URL
 
     # Cleanup repo
     os.chdir("/root")
     import shutil as _sh
     _sh.rmtree(repo_dir, ignore_errors=True)
 
+    # Keep "filename" for continuity (not strictly used with Stream)
+    filename = f"{title}.mp4"
     return {
         "filename": filename,
         "input_size_mb": input_size_mb,
         "output_size_mb": output_size_mb,
-        "cdn_url": cdn_url,
+        "cdn_url": cdn_url,   # embed/player URL
+        "video_guid": guid,
     }
 
-# ---------------- GPU functions (unchanged behavior) ----------------
+# ---------------- GPU wrappers ----------------
 
 @app.function(
     image=image,
     gpu="H100",
     timeout=7200,
-    volumes={"/models": model_volume, "/outputs": output_volume},
+    volumes={"/models": model_volume},
     scaledown_window=300,
     max_containers=10,
 )
@@ -325,7 +335,7 @@ def upscale_video_h100(
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
 ):
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
@@ -336,7 +346,7 @@ def upscale_video_h100(
     image=image,
     gpu="H200",
     timeout=7200,
-    volumes={"/models": model_volume, "/outputs": output_volume},
+    volumes={"/models": model_volume},
     scaledown_window=300,
     max_containers=10,
 )
@@ -348,50 +358,50 @@ def upscale_video_h200(
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
 ):
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
         stitch_mode, model, resolution, gpu_type="H200", job_id=job_id
     )
 
-# ---------------- FastAPI App (kept familiar; now returns CDN URL) ----------------
+# ---------------- FastAPI app ----------------
 
 @app.function(
     image=image,
-    volumes={"/outputs": output_volume},
     timeout=7200,
     scaledown_window=60,
 )
 @modal.asgi_app()
 def fastapi_app():
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import RedirectResponse
     from pydantic import BaseModel
-    import time, uuid, os, asyncio
+    from fastapi.responses import RedirectResponse
+    import time, uuid, os, asyncio, json as _json
 
     web_app = FastAPI()
 
-    JOBS_DIR = "/outputs/jobs"
-    os.makedirs(JOBS_DIR, exist_ok=True)  # local container view; no commits
+    # Local job cache (not shared across containers; sufficient for one web app)
+    JOBS_DIR = "/root/jobs"
+    os.makedirs(JOBS_DIR, exist_ok=True)
 
     def save_job(job_id: str, job_data: dict):
-        with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
-            json.dump(job_data, f)
-        # NOTE: no output_volume.commit()
+        try:
+            with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
+                _json.dump(job_data, f)
+        except Exception as e:
+            print(f"⚠️ save_job error: {e}")
 
-    def load_job(job_id: str) -> Optional[dict]:
-        job_file = f"{JOBS_DIR}/{job_id}.json"
-        if not os.path.exists(job_file):
-            # Try reload (won't help across containers without commit, but harmless)
-            try:
-                output_volume.reload()
-            except Exception:
-                pass
-        if not os.path.exists(job_file):
+    def load_job(job_id: str):
+        try:
+            path = f"{JOBS_DIR}/{job_id}.json"
+            if not os.path.exists(path):
+                return None
+            with open(path, "r") as f:
+                return _json.load(f)
+        except Exception as e:
+            print(f"⚠️ load_job error: {e}")
             return None
-        with open(job_file, "r") as f:
-            return json.load(f)
 
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
@@ -412,12 +422,13 @@ def fastapi_app():
         job_id: str
         status: str
         progress: Optional[str] = None
-        download_url: Optional[str] = None
+        download_url: Optional[str] = None  # embed URL
         filename: Optional[str] = None
         input_size_mb: Optional[float] = None
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
         elapsed_seconds: Optional[float] = None
+        video_guid: Optional[str] = None
 
     def process_video(job_id: str, request: UpscaleRequest):
         try:
@@ -425,8 +436,8 @@ def fastapi_app():
             job_data.update({"status": "processing", "progress": "Starting upscaler..."})
             save_job(job_id, job_data)
 
-            # choose GPU
-            if request.resolution in ['720p', '1080p']:
+            # Choose GPU
+            if request.resolution in ["720p", "1080p"]:
                 res = upscale_video_h100.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
@@ -435,7 +446,7 @@ def fastapi_app():
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id,
                 )
             else:
                 res = upscale_video_h200.remote(
@@ -446,23 +457,23 @@ def fastapi_app():
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id,
                 )
 
-            filename = res["filename"]
-            cdn_url = res["cdn_url"]
-
+            # Persist results
             job_data = load_job(job_id) or {}
             job_data.update({
                 "status": "completed",
-                "download_url": cdn_url,
-                "filename": filename,
+                "download_url": res["cdn_url"],   # embed URL
+                "filename": res["filename"],
                 "input_size_mb": res["input_size_mb"],
                 "output_size_mb": res["output_size_mb"],
-                "progress": "✅ Completed successfully!"
+                "video_guid": res.get("video_guid"),
+                "progress": "✅ Completed successfully!",
             })
             save_job(job_id, job_data)
 
+            # Clear progress_dict entry
             try:
                 if job_id in progress_dict:
                     del progress_dict[job_id]
@@ -485,46 +496,45 @@ def fastapi_app():
             raise HTTPException(status_code=400, detail="Must provide either video_url or video_base64")
 
         job_id = str(uuid.uuid4())
-        gpu_type = "H100" if request.resolution in ['720p', '1080p'] else "H200"
+        gpu_type = "H100" if request.resolution in ["720p", "1080p"] else "H200"
 
-        job_data = {
+        save_job(job_id, {
             "job_id": job_id,
             "status": "pending",
             "created_at": time.time(),
             "gpu_type": gpu_type,
-            "request": request.model_dump()
-        }
-        save_job(job_id, job_data)
+            "request": request.model_dump(),
+        })
 
+        # run job in background (keeps web app responsive)
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
 
         return {
             "job_id": job_id,
             "status": "pending",
             "message": f"Job submitted. Check status: GET /status/{job_id}",
-            "gpu_type": gpu_type
+            "gpu_type": gpu_type,
         }
 
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
-        # real-time progress
-        realtime_progress = None
+        # real-time progress from shared dict
+        realtime = None
         try:
             if job_id in progress_dict:
                 pd = progress_dict[job_id]
-                realtime_progress = pd.get("text") if isinstance(pd, dict) else pd
+                realtime = pd.get("text") if isinstance(pd, dict) else pd
         except Exception:
             pass
 
         job_data = load_job(job_id)
         if not job_data:
-            # If file not there yet, still report progress if we have it
-            if realtime_progress:
-                return JobStatus(job_id=job_id, status="processing", progress=realtime_progress)
+            if realtime:
+                return JobStatus(job_id=job_id, status="processing", progress=realtime)
             raise HTTPException(status_code=404, detail="Job not found")
 
-        if realtime_progress:
-            job_data["progress"] = realtime_progress
+        if realtime:
+            job_data["progress"] = realtime
 
         created_at = job_data.get("created_at")
         elapsed = (time.time() - created_at) if created_at else None
@@ -533,22 +543,19 @@ def fastapi_app():
             job_id=job_id,
             status=job_data.get("status", "pending"),
             progress=job_data.get("progress"),
-            download_url=job_data.get("download_url"),
+            download_url=job_data.get("download_url"),  # embed URL
             filename=job_data.get("filename"),
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
             error=job_data.get("error"),
-            elapsed_seconds=elapsed
+            elapsed_seconds=elapsed,
+            video_guid=job_data.get("video_guid"),
         )
 
-    @web_app.get("/download/{filename}")
-    async def download_redirect(filename: str):
-        """
-        Backward-compatible endpoint:
-        we don't serve files from Modal anymore; redirect to CDN location.
-        """
-        cdn_url = f"{BUNNY_BASE_URL}/{BUNNY_ROOT_DIR}/{filename}"
-        return RedirectResponse(cdn_url, status_code=302)
+    @web_app.get("/download/{guid}")
+    async def redirect_embed(guid: str):
+        """Optional convenience: redirect to the embed player for a GUID."""
+        return RedirectResponse(bunny_embed_url(guid), status_code=302)
 
     @web_app.get("/")
     async def root():
@@ -559,7 +566,7 @@ def fastapi_app():
                 if fn.endswith(".json"):
                     try:
                         with open(f"{JOBS_DIR}/{fn}", "r") as f:
-                            jd = json.load(f)
+                            jd = _json.load(f)
                         if jd.get("status") in ("pending", "processing"):
                             active += 1
                     except Exception:
@@ -567,13 +574,13 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "3.5-bunnycdn",
+            "version": "4.0 - Bunny Video Library",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
-                "download": "GET /download/{filename} (redirects to CDN)"
+                "download": "GET /download/{guid} (redirects to player)",
             },
-            "active_jobs": active
+            "active_jobs": active,
         }
 
     return web_app
