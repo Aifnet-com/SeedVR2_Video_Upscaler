@@ -1,29 +1,22 @@
 """
-Async Modal deployment with persistent job tracking for SeedVR2 Video Upscaler
-Uploads results directly to BunnyCDN - NO Modal volume commits!
-Supports both URL and local file inputs with REAL-TIME LOG STREAMING via Modal Dict
-Includes WATCHDOG to detect and kill stalled processes
+SeedVR2 Upscaler (Modal + FastAPI)
+- H100 for 720p/1080p, H200 for 2K/4K
+- Real-time progress via Modal Dict
+- Watchdog to kill stalled runs
+- FINAL ARTIFACT: uploaded directly to Bunny Storage via HTTPS PUT
+- Status returns a DIRECT CDN URL (no Modal volume commits)
 """
 
 import modal
-from typing import Dict, Optional
+from typing import Optional
 import json
-from base64 import b64decode
-import os
 
-# Create Modal app
+# ---------------- Modal app & shared state ----------------
+
 app = modal.App("seedvr2-upscaler")
-
-# Create a shared dict for real-time progress updates (in-memory, fast)
 progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
 
-# BunnyCDN Storage Configuration (FTP)
-BUNNYCDN_STORAGE_HOSTNAME = "storage.bunnycdn.com"
-BUNNYCDN_STORAGE_USERNAME = "aifnet"
-BUNNYCDN_STORAGE_PASSWORD = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"
-BUNNYCDN_CDN_HOSTNAME = "aifnet.b-cdn.net"
-
-# Define the container image with all dependencies
+# Base image & deps
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("libgl1", "libglib2.0-0", "ffmpeg", "git")
@@ -31,7 +24,7 @@ image = (
         "torch==2.5.1",
         "torchvision==0.20.1",
         "torchaudio==2.5.1",
-        index_url="https://download.pytorch.org/whl/cu121"
+        index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
         "opencv-python-headless==4.10.0.84",
@@ -47,96 +40,272 @@ image = (
         "accelerate>=1.1.1",
         "huggingface-hub>=0.26.2",
         "requests>=2.32.3",
-        "fastapi[standard]"
+        "fastapi[standard]",
     )
 )
 
-# Create persistent volume for models only
+# Models volume only (final files no longer use a Modal volume)
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 
-# BunnyCDN Storage Helper (FTP)
-def upload_to_bunny_storage(file_path: str, remote_filename: str) -> str:
-    """Upload video to BunnyCDN Storage via FTP - returns immediate CDN URL"""
-    from ftplib import FTP
-    import os
-    
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    print(f"📤 Uploading {file_size_mb:.2f} MB to BunnyCDN Storage via FTP...")
-    
-    try:
-        # Connect to FTP server
-        ftp = FTP(timeout=60)
-        ftp.connect(BUNNYCDN_STORAGE_HOSTNAME, 21)
-        ftp.login(BUNNYCDN_STORAGE_USERNAME, BUNNYCDN_STORAGE_PASSWORD)
-        ftp.set_pasv(True)  # Use passive mode
-        
-        # Navigate to/create target directory
-        remote_dir = "/tests/seedvr2_results"
-        dirs = remote_dir.strip('/').split('/')
-        
-        print(f"📁 Current directory: {ftp.pwd()}")
-        print(f"📁 Navigating to {remote_dir}")
-        
-        # Create each directory level if needed
-        for d in dirs:
-            try:
-                ftp.cwd(d)
-                print(f"  ✓ Entered /{d}")
-            except Exception as dir_err:
-                # Directory doesn't exist, try to create it
-                print(f"  📁 Creating /{d}")
-                try:
-                    ftp.mkd(d)
-                    ftp.cwd(d)
-                    print(f"  ✓ Created and entered /{d}")
-                except Exception as mk_err:
-                    print(f"  ⚠️  Error with {d}: {mk_err}")
-                    # List available directories for debugging
-                    try:
-                        print(f"  📂 Available: {ftp.nlst()}")
-                    except:
-                        pass
-                    raise Exception(f"Cannot create/access directory {d}: {mk_err}")
-        
-        print(f"✅ In target directory: {ftp.pwd()}")
-        
-        # Upload the file
-        print(f"📤 Uploading {remote_filename}...")
-        with open(file_path, 'rb') as f:
-            ftp.storbinary(f'STOR {remote_filename}', f)
-        
-        ftp.quit()
-        
-        print(f"✅ Upload successful!")
-        
-        # Return immediate CDN URL (no transcoding needed!)
-        cdn_url = f"https://{BUNNYCDN_CDN_HOSTNAME}/tests/seedvr2_results/{remote_filename}"
-        return cdn_url
-        
-    except Exception as e:
-        # Fallback: try uploading to root directory if subdirectories don't work
+# ---------------- Bunny Storage (NOT Video Library) ----------------
+# Zone: aifnet
+BUNNY_HOST = "storage.bunnycdn.com"
+BUNNY_STORAGE_ZONE = "aifnet"  # storage zone name
+BUNNY_STORAGE_KEY = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"  # Storage Zone FTP/API password
+BUNNY_BASE_URL = "https://aifnet.b-cdn.net"
+# Path INSIDE the zone (do NOT include the zone name again)
+BUNNY_ROOT_DIR = "tests/seedvr2_results"
+
+def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
+    """
+    Upload to Bunny Storage via HTTPS PUT with AccessKey header.
+    zone_rel_path is path *inside* the zone (e.g. "tests/seedvr2_results/foo.mp4").
+    Returns the CDN URL: https://aifnet.b-cdn.net/<zone_rel_path>
+    """
+    import requests, time as _t
+
+    zone_rel_path = zone_rel_path.lstrip("/")
+    url = f"https://{BUNNY_HOST}/{BUNNY_STORAGE_ZONE}/{zone_rel_path}"
+
+    headers = {
+        "AccessKey": BUNNY_STORAGE_KEY,
+        "Content-Type": "application/octet-stream",
+        "Connection": "close",
+    }
+
+    for attempt in range(3):
         try:
-            print(f"⚠️  Subdirectory upload failed, trying root directory...")
-            ftp2 = FTP(timeout=60)
-            ftp2.connect(BUNNYCDN_STORAGE_HOSTNAME, 21)
-            ftp2.login(BUNNYCDN_STORAGE_USERNAME, BUNNYCDN_STORAGE_PASSWORD)
-            ftp2.set_pasv(True)
-            
-            print(f"📤 Uploading {remote_filename} to root...")
-            with open(file_path, 'rb') as f:
-                ftp2.storbinary(f'STOR {remote_filename}', f)
-            
-            ftp2.quit()
-            print(f"✅ Upload successful to root!")
-            
-            # Return CDN URL from root
-            cdn_url = f"https://{BUNNYCDN_CDN_HOSTNAME}/{remote_filename}"
-            return cdn_url
-            
-        except Exception as e2:
-            raise Exception(f"FTP upload failed (both subdirectory and root): {e}, {e2}")
+            with open(local_path, "rb") as f:
+                resp = requests.put(url, headers=headers, data=f, timeout=600)
+            if resp.status_code in (200, 201):
+                return f"{BUNNY_BASE_URL}/{zone_rel_path}"
+            else:
+                print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:300]}")
+        except Exception as e:
+            print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
+        _t.sleep(2 * (attempt + 1))
 
+    raise Exception("Bunny upload failed after 3 attempts")
 
+# ---------------- Utility: progress + timeout heuristics ----------------
+
+def _update_job_progress(job_id: str, progress_text: str):
+    """Update progress in shared dict (fast path)."""
+    if not job_id:
+        return
+    import time
+    try:
+        progress_dict[job_id] = {"text": progress_text, "timestamp": time.time()}
+    except Exception as e:
+        print(f"⚠️ progress_dict update failed: {e}")
+
+def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
+    """
+    Timeout must exceed per-batch processing time (we only log between batches).
+    Empirical seconds per 100 frames:
+      720p ~50, 1080p ~70, 2k ~120, 4k ~250.
+    """
+    time_per_100_frames = {"720p": 50, "1080p": 70, "2k": 120, "4k": 250}
+    base = time_per_100_frames.get(resolution, 62)
+    expected_batch = int(base * (batch_size / 100))
+    first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)  # add model load + slack
+    return first_batch_timeout
+
+# ---------------- Core upscaler implementation ----------------
+
+def _upscale_video_impl(
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    batch_size: int = 100,
+    temporal_overlap: int = 12,
+    stitch_mode: str = "crossfade",
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    resolution: str = "1080p",
+    gpu_type: str = "H100",
+    job_id: Optional[str] = None,
+):
+    """
+    Run SeedVR2, then upload the resulting MP4 to Bunny Storage.
+    Returns filename, sizes, and the direct CDN URL (cdn_url).
+    """
+    import subprocess, tempfile, os, requests, hashlib, time as time_module
+    import shutil, cv2, math, threading, signal
+
+    print(f"🚀 Starting SeedVR2 on {gpu_type} @ {resolution}")
+    _update_job_progress(job_id, "🚀 Initializing upscaler...")
+
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+
+    repo_dir = tempfile.mkdtemp(prefix="seedvr_")
+    _update_job_progress(job_id, "📂 Cloning repository...")
+    try:
+        subprocess.run(
+            ["git", "clone", "https://github.com/Aifnet-com/SeedVR2_Video_Upscaler.git", repo_dir],
+            check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Git clone failed: {e.stderr}")
+        raise
+    os.chdir(repo_dir)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.mp4")
+        output_tmp = os.path.join(tmpdir, "output.mp4")
+
+        # Input fetch/prepare
+        if video_url:
+            _update_job_progress(job_id, "📥 Downloading video...")
+            r = requests.get(video_url, stream=True, timeout=300)
+            r.raise_for_status()
+            with open(input_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
+        elif video_base64:
+            _update_job_progress(job_id, "📥 Decoding video...")
+            from base64 import b64decode as _b64
+            with open(input_path, "wb") as f:
+                f.write(_b64(video_base64))
+            url_hash = hashlib.md5(video_base64.encode()).hexdigest()[:8]
+        else:
+            raise Exception("Must provide either video_url or video_base64")
+
+        input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+
+        # Probe
+        _update_job_progress(job_id, "📐 Analyzing video...")
+        cap = cv2.VideoCapture(input_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if w == 0 or h == 0:
+            raise Exception(f"Could not read input dimensions ({w}x{h})")
+
+        # Timeouts
+        stall_timeout = _calculate_stall_timeout(resolution, batch_size)
+
+        # Target dims by pixel budget (rounded to /16)
+        target_pixels_map = {"720p": 921600, "1080p": 2073600, "2k": 3686400, "4k": 8294400}
+        tgt = target_pixels_map.get(resolution, 2073600)
+        ratio = math.sqrt(tgt / (w * h))
+        out_w = round((w * ratio) / 16) * 16
+        out_h = round((h * ratio) / 16) * 16
+        res_px = min(out_w, out_h)
+
+        # Build CLI
+        cmd = [
+            "python", "inference_cli.py",
+            "--video_path", input_path,
+            "--batch_size", str(batch_size),
+            "--temporal_overlap", str(temporal_overlap),
+            "--stitch_mode", stitch_mode,
+            "--model", model,
+            "--resolution", str(res_px),
+            "--model_dir", "/models",
+            "--output", output_tmp,
+            "--debug",
+        ]
+
+        _update_job_progress(job_id, "🔧 Starting upscale process...")
+
+        # Run with streaming + watchdog
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=repo_dir,
+            preexec_fn=os.setsid
+        )
+
+        lines = []
+        last_heartbeat = time as time_module
+        last_heartbeat = time_module.time()
+        stalled_kill = False
+        is_first_batch = True
+
+        def watchdog():
+            nonlocal stalled_kill, last_heartbeat, is_first_batch
+            while proc.poll() is None:
+                time_module.sleep(10)
+                if time_module.time() - last_heartbeat > stall_timeout:
+                    print("🚨 WATCHDOG: stalled, killing process group")
+                    stalled_kill = True
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        time_module.sleep(2)
+                        if proc.poll() is None:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception as e:
+                        print(f"⚠️ watchdog kill error: {e}")
+                    break
+
+        import threading as _t
+        _t.Thread(target=watchdog, daemon=True).start()
+
+        for line in iter(proc.stdout.readline, ''):
+            if not line:
+                break
+            line = line.rstrip()
+            lines.append(line)
+            print(line)  # modal logs
+            # heuristics for progress
+            p = None
+            if "Window" in line and "-" in line:
+                p = line.strip()
+            elif "Time batch:" in line:
+                p = line.strip()
+                if is_first_batch:
+                    is_first_batch = False
+            elif "Batch" in line and "/" in line:
+                p = line.strip()
+            elif "Loading model" in line or "Model loaded" in line:
+                p = "⚙️ " + line.strip()
+            elif "Downloading" in line:
+                p = "⬇️ " + line.strip()
+            elif "Processing" in line and "frames" in line:
+                p = "🎬 " + line.strip()
+
+            if p:
+                _update_job_progress(job_id, p)
+                last_heartbeat = time_module.time()
+            elif line.strip():
+                last_heartbeat = time_module.time()
+
+        proc.wait()
+        if stalled_kill:
+            raise Exception(f"Job stalled (>{stall_timeout}s) and was killed")
+        if proc.returncode != 0:
+            tail = "\n".join(lines[-20:])
+            raise Exception(f"Upscaling failed:\n{tail}")
+        if not os.path.exists(output_tmp):
+            raise Exception("Output file not created")
+
+        output_size_mb = os.path.getsize(output_tmp) / (1024 * 1024)
+        _update_job_progress(job_id, "✅ Uploading to Bunny Storage...")
+
+        # -------- Upload to Bunny Storage (DIRECT CDN URL) --------
+        timestamp = int(time_module.time())
+        filename = f"{url_hash}_{resolution}_{timestamp}.mp4"
+        zone_rel_path = f"{BUNNY_ROOT_DIR}/{filename}"  # e.g. tests/seedvr2_results/abc_720p_123.mp4
+        cdn_url = upload_to_bunny_storage(output_tmp, zone_rel_path)
+        print(f"✅ Uploaded to Bunny Storage: {cdn_url}")
+
+    # Cleanup repo
+    os.chdir("/root")
+    import shutil as _sh
+    _sh.rmtree(repo_dir, ignore_errors=True)
+
+    return {
+        "filename": filename,
+        "input_size_mb": input_size_mb,
+        "output_size_mb": output_size_mb,
+        "cdn_url": cdn_url,   # direct file URL
+    }
+
+# ---------------- GPU wrappers ----------------
 
 @app.function(
     image=image,
@@ -154,14 +323,12 @@ def upscale_video_h100(
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
 ):
-    """Upscale a video using SeedVR2 from URL or base64 data (H100 for 720p/1080p)"""
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
         stitch_mode, model, resolution, gpu_type="H100", job_id=job_id
     )
-
 
 @app.function(
     image=image,
@@ -179,362 +346,49 @@ def upscale_video_h200(
     stitch_mode: str = "crossfade",
     model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
 ):
-    """Upscale a video using SeedVR2 from URL or base64 data (H200 for 2K/4K)"""
     return _upscale_video_impl(
         video_url, video_base64, batch_size, temporal_overlap,
         stitch_mode, model, resolution, gpu_type="H200", job_id=job_id
     )
 
-
-def _update_job_progress(job_id: str, progress_text: str):
-    """Update job progress in Modal Dict"""
-    if not job_id:
-        return
-
-    import time
-
-    try:
-        progress_dict[job_id] = {
-            "text": progress_text,
-            "timestamp": time.time()
-        }
-    except Exception as e:
-        print(f"⚠️  Failed to update progress: {e}")
-
-
-def _calculate_stall_timeout(resolution: str, batch_size: int = 100, total_frames: int = None) -> tuple:
-    """
-    Calculate stall timeout based on resolution and batch size
-    Returns (first_batch_timeout, regular_batch_timeout)
-    """
-
-    # Base time per 100 frames in seconds (empirical data)
-    time_per_100_frames = {
-        '720p': 50,
-        '1080p': 70,
-        '2k': 120,
-        '4k': 250,
-    }
-
-    base_time_per_100 = time_per_100_frames.get(resolution, 70)
-
-    # Expected time for this batch size
-    expected_batch_time = int(base_time_per_100 * (batch_size / 100))
-
-    # Add overhead for model loading (first batch only)
-    model_loading_overhead = 45
-
-    # Calculate timeouts with safety margin (1.5x)
-    first_batch_timeout = int((expected_batch_time + model_loading_overhead) * 1.5)
-    regular_batch_timeout = int(expected_batch_time * 1.5)
-
-    # Set minimum timeouts
-    first_batch_timeout = max(first_batch_timeout, 180)  # At least 3 minutes
-    regular_batch_timeout = max(regular_batch_timeout, 60)  # At least 1 minute
-
-    print(f"📊 Stall timeout calculation:")
-    print(f"   Resolution: {resolution}, Batch size: {batch_size}")
-    print(f"   Base time per 100 frames: {base_time_per_100}s")
-    print(f"   Expected time for {batch_size} frames: {expected_batch_time}s")
-    print(f"   First batch timeout: {first_batch_timeout}s ({first_batch_timeout/60:.1f} min)")
-    print(f"   Regular batch timeout: {regular_batch_timeout}s ({regular_batch_timeout/60:.1f} min)")
-
-    return first_batch_timeout, regular_batch_timeout
-
-
-def _upscale_video_impl(
-    video_url: Optional[str] = None,
-    video_base64: Optional[str] = None,
-    batch_size: int = 100,
-    temporal_overlap: int = 12,
-    stitch_mode: str = "crossfade",
-    model: str = "seedvr2_ema_7b_fp16.safetensors",
-    resolution: str = "1080p",
-    gpu_type: str = "H100",
-    job_id: Optional[str] = None
-):
-    """Upscale a video using SeedVR2 from URL or base64 data with real-time progress updates and watchdog"""
-    import subprocess
-    import tempfile
-    import os
-    import requests
-    import hashlib
-    import time as time_module
-    import shutil
-    import cv2
-    import math
-    import threading
-    import signal
-
-    print(f"🚀 Starting SeedVR2 upscaling on {gpu_type}")
-    print(f"📋 Config: batch_size={batch_size}, overlap={temporal_overlap}, mode={stitch_mode}, target={resolution}")
-
-    _update_job_progress(job_id, "🚀 Initializing upscaler...")
-
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
-
-    # Clone repo to unique temp directory
-    repo_dir = tempfile.mkdtemp(prefix="seedvr_")
-    print(f"📂 Cloning repo to: {repo_dir}")
-    _update_job_progress(job_id, "📂 Cloning repository...")
-
-    try:
-        subprocess.run(
-            ["git", "clone", "https://github.com/Aifnet-com/SeedVR2_Video_Upscaler.git", repo_dir],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"Git clone failed: {e.stderr}")
-        raise
-
-    os.chdir(repo_dir)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.mp4")
-        temp_output_path = os.path.join(tmpdir, "output.mp4")
-
-        # Download or decode video
-        if video_url:
-            print(f"📥 Downloading video from URL: {video_url}")
-            _update_job_progress(job_id, "📥 Downloading video...")
-            response = requests.get(video_url, stream=True, timeout=300)
-            response.raise_for_status()
-
-            with open(input_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            # Use URL for filename hash
-            url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
-        elif video_base64:
-            print(f"📥 Decoding video from base64")
-            _update_job_progress(job_id, "📥 Decoding video...")
-            video_bytes = b64decode(video_base64)
-            with open(input_path, 'wb') as f:
-                f.write(video_bytes)
-            url_hash = hashlib.md5(video_base64.encode()).hexdigest()[:8]
-        else:
-            raise Exception("Must provide either video_url or video_base64")
-
-        input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        print(f"📦 Input video size: {input_size_mb:.2f} MB")
-
-        # Get video dimensions and duration
-        _update_job_progress(job_id, "📐 Analyzing video dimensions...")
-        cap = cv2.VideoCapture(input_path)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_duration = frame_count / fps if fps > 0 else 30
-        cap.release()
-
-        if width == 0 or height == 0:
-            raise Exception(f"Could not read video dimensions: {width}x{height}")
-
-        print(f"📐 Input dimensions: {width}x{height}")
-        print(f"⏱️  Video duration: {video_duration:.1f} seconds ({frame_count} frames @ {fps:.2f} fps)")
-
-        # Calculate stall timeout based on batch size, total frames, and resolution
-        # This is critical: we only get updates BETWEEN batches!
-        first_batch_timeout, regular_batch_timeout = _calculate_stall_timeout(resolution, batch_size, frame_count)
-
-        # Calculate target resolution based on input dimensions
-        target_pixels_map = {
-            '720p': 921600,   # 1280x720
-            '1080p': 2073600, # 1920x1080
-            '2k': 3686400,    # 2560x1440
-            '4k': 8294400,    # 3840x2160
-        }
-
-        target_pixels = target_pixels_map.get(resolution, 2073600)
-
-        # Initial scale based on target pixel count
-        ratio = math.sqrt(target_pixels / (width * height))
-        new_width = width * ratio
-        new_height = height * ratio
-
-        # Round BOTH dimensions to nearest multiple of 16
-        new_width = round(new_width / 16) * 16
-        new_height = round(new_height / 16) * 16
-
-        # Use minimum side (short side) as resolution parameter
-        resolution_px = min(new_width, new_height)
-
-        print(f"📐 Calculated output: {new_width}x{new_height} (resolution={resolution_px}px)")
-        print(f"   Target pixels: {target_pixels:,}")
-        print(f"   Actual pixels: {new_width * new_height:,} ({((new_width * new_height / target_pixels - 1) * 100):+.1f}%)")
-
-        cmd = [
-            "python", "inference_cli.py",
-            "--video_path", input_path,
-            "--batch_size", str(batch_size),
-            "--temporal_overlap", str(temporal_overlap),
-            "--stitch_mode", stitch_mode,
-            "--model", model,
-            "--resolution", str(int(resolution_px)),
-            "--model_dir", "/models",
-            "--output", temp_output_path,
-            "--debug"
-        ]
-
-        print(f"🔧 Running upscaler with real-time logging and watchdog...")
-        _update_job_progress(job_id, "🔧 Starting upscale process...")
-
-        # Run with REAL-TIME OUTPUT STREAMING + WATCHDOG
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            cwd=repo_dir,
-            preexec_fn=os.setsid
-        )
-
-        full_output = []
-        last_progress_update = ""
-        last_heartbeat = time_module.time()
-        watchdog_killed = False
-        is_first_batch = True
-        current_stall_timeout = first_batch_timeout
-
-        # Watchdog thread
-        def watchdog():
-            nonlocal watchdog_killed, last_heartbeat, is_first_batch, current_stall_timeout
-
-            while process.poll() is None:
-                elapsed = int(time_module.time() - last_heartbeat)
-                timeout = current_stall_timeout
-
-                batch_type = "FIRST_BATCH" if is_first_batch else "REGULAR"
-
-                if elapsed % 10 == 0 and elapsed > 0:
-                    print(f"🐕 Watchdog [{batch_type}]: {elapsed}s / {timeout}s")
-
-                if elapsed > timeout:
-                    print(f"⚠️  WATCHDOG: Process stalled for {elapsed}s (timeout: {timeout}s)")
-                    print(f"⚠️  WATCHDOG: Killing process group...")
-                    watchdog_killed = True
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                    except:
-                        process.kill()
-                    break
-
-                time_module.sleep(1)
-
-        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
-        watchdog_thread.start()
-
-        # Stream output
-        for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
-
-            line = line.strip()
-            if line:
-                print(line)
-                full_output.append(line)
-                last_heartbeat = time_module.time()
-
-                # Detect first batch completion and switch to faster timeout
-                if "✅ First batch completed" in line or "First batch: OK" in line:
-                    if is_first_batch:
-                        print(f"✅ First batch completed - switching to faster watchdog timeout")
-                        is_first_batch = False
-                        current_stall_timeout = regular_batch_timeout
-
-                # Extract and forward progress updates
-                if any(keyword in line for keyword in ["Processing batch", "frames processed", "Upscaling", "🎬 Batch", "💾 Processing"]):
-                    if line != last_progress_update:
-                        _update_job_progress(job_id, line)
-                        last_progress_update = line
-
-        process.wait()
-
-        if watchdog_killed:
-            raise Exception(f"Process stalled for more than {current_stall_timeout}s and was killed by watchdog")
-
-        if process.returncode != 0:
-            error_msg = "\n".join(full_output[-20:])  # Last 20 lines
-            print(f"❌ Error: {error_msg}")
-            raise Exception(f"Upscaling failed: {error_msg}")
-
-        if not os.path.exists(temp_output_path):
-            raise Exception("Output file not created")
-
-        output_size_mb = os.path.getsize(temp_output_path) / (1024 * 1024)
-        print(f"✅ Output video size: {output_size_mb:.2f} MB")
-
-        # Upload to BunnyCDN instead of Modal volume
-        _update_job_progress(job_id, "📤 Uploading to CDN...")
-
-        # Generate unique filename for FTP storage
-        timestamp = int(time_module.time())
-        filename = f"upscaled_{url_hash}_{resolution}_{timestamp}.mp4"
-
-        # Upload via FTP to BunnyCDN Storage (immediate access!)
-        cdn_url = upload_to_bunny_storage(temp_output_path, filename)
-
-        print(f"✅ CDN URL: {cdn_url}")
-        _update_job_progress(job_id, "✅ Upload complete!")
-
-    # Cleanup
-    os.chdir("/root")
-    shutil.rmtree(repo_dir, ignore_errors=True)
-
-    return {
-        "cdn_url": cdn_url,
-        "filename": filename,
-        "input_size_mb": input_size_mb,
-        "output_size_mb": output_size_mb,
-        "resolution": resolution
-    }
-
+# ---------------- FastAPI app ----------------
 
 @app.function(
     image=image,
-    scaledown_window=300,
+    timeout=7200,
+    scaledown_window=60,
 )
-@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def fastapi_app():
-    """FastAPI webhook for job submission and status checking"""
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
-    import uuid
-    import time
-    import asyncio
+    import time, uuid, os, asyncio, json as _json
 
     web_app = FastAPI()
 
-    JOBS_DIR = "/tmp/jobs"  # Use local temp storage instead of volume
+    # Local job cache (simple; okay since one web app handles status)
+    JOBS_DIR = "/root/jobs"
     os.makedirs(JOBS_DIR, exist_ok=True)
 
     def save_job(job_id: str, job_data: dict):
-        """Save job to local storage"""
         try:
-            job_file = f"{JOBS_DIR}/{job_id}.json"
-            with open(job_file, "w") as f:
-                json.dump(job_data, f)
+            with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
+                _json.dump(job_data, f)
         except Exception as e:
-            print(f"⚠️  Error saving job {job_id}: {e}")
+            print(f"⚠️ save_job error: {e}")
 
-    def load_job(job_id: str) -> Optional[dict]:
-        """Load job from local storage"""
-        job_file = f"{JOBS_DIR}/{job_id}.json"
+    def load_job(job_id: str):
         try:
-            if os.path.exists(job_file):
-                with open(job_file, "r") as f:
-                    return json.load(f)
+            path = f"{JOBS_DIR}/{job_id}.json"
+            if not os.path.exists(path):
+                return None
+            with open(path, "r") as f:
+                return _json.load(f)
         except Exception as e:
-            print(f"⚠️  Error loading job {job_id}: {e}")
-        return None
+            print(f"⚠️ load_job error: {e}")
+            return None
 
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
@@ -555,7 +409,7 @@ def fastapi_app():
         job_id: str
         status: str
         progress: Optional[str] = None
-        cdn_url: Optional[str] = None
+        download_url: Optional[str] = None  # direct CDN URL
         filename: Optional[str] = None
         input_size_mb: Optional[float] = None
         output_size_mb: Optional[float] = None
@@ -563,21 +417,14 @@ def fastapi_app():
         elapsed_seconds: Optional[float] = None
 
     def process_video(job_id: str, request: UpscaleRequest):
-        """Process video upscaling job"""
         try:
-            # Update job status
-            job_data = load_job(job_id)
-            if job_data:
-                job_data["status"] = "processing"
-                job_data["progress"] = "Starting upscaler..."
-                save_job(job_id, job_data)
+            job_data = load_job(job_id) or {}
+            job_data.update({"status": "processing", "progress": "Starting upscaler..."})
+            save_job(job_id, job_data)
 
-            print(f"[Job {job_id}] Starting upscale_video.remote()")
-
-            # Select GPU function
-            if request.resolution in ['720p', '1080p']:
-                print(f"[Job {job_id}] Using H100 for {request.resolution}")
-                result = upscale_video_h100.remote(
+            # Choose GPU
+            if request.resolution in ["720p", "1080p"]:
+                res = upscale_video_h100.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
                     batch_size=request.batch_size,
@@ -585,11 +432,10 @@ def fastapi_app():
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id,
                 )
             else:
-                print(f"[Job {job_id}] Using H200 for {request.resolution}")
-                result = upscale_video_h200.remote(
+                res = upscale_video_h200.remote(
                     video_url=request.video_url,
                     video_base64=request.video_base64,
                     batch_size=request.batch_size,
@@ -597,137 +443,122 @@ def fastapi_app():
                     stitch_mode=request.stitch_mode,
                     model=request.model,
                     resolution=request.resolution,
-                    job_id=job_id
+                    job_id=job_id,
                 )
 
-            print(f"[Job {job_id}] Result: {result}")
+            # Persist results
+            job_data = load_job(job_id) or {}
+            job_data.update({
+                "status": "completed",
+                "download_url": res["cdn_url"],   # direct CDN file
+                "filename": res["filename"],
+                "input_size_mb": res["input_size_mb"],
+                "output_size_mb": res["output_size_mb"],
+                "progress": "✅ Completed successfully!",
+            })
+            save_job(job_id, job_data)
 
-            # Update job with result
-            job_data = load_job(job_id)
-            if job_data:
-                job_data.update({
-                    "status": "completed",
-                    "cdn_url": result.get("cdn_url"),
-                    "filename": result.get("filename"),
-                    "input_size_mb": result.get("input_size_mb", 0),
-                    "output_size_mb": result.get("output_size_mb", 0),
-                    "progress": "✅ Completed and uploaded to CDN!"
-                })
-                save_job(job_id, job_data)
-
-            # Clear progress dict
+            # Clear progress entry
             try:
                 if job_id in progress_dict:
                     del progress_dict[job_id]
-            except:
+            except Exception:
                 pass
 
-            print(f"[Job {job_id}] ✅ Completed successfully")
-
         except Exception as e:
-            print(f"[Job {job_id}] ❌ Failed: {str(e)}")
-            job_data = load_job(job_id)
-            if job_data:
-                job_data.update({
-                    "status": "failed",
-                    "error": str(e),
-                    "progress": f"❌ Failed: {str(e)}"
-                })
-                save_job(job_id, job_data)
-
+            job_data = load_job(job_id) or {}
+            job_data.update({"status": "failed", "error": str(e), "progress": f"❌ Failed: {e}"})
+            save_job(job_id, job_data)
             try:
                 if job_id in progress_dict:
                     del progress_dict[job_id]
-            except:
+            except Exception:
                 pass
 
     @web_app.post("/upscale", response_model=JobResponse)
     async def upscale_endpoint(request: UpscaleRequest):
-        """Submit a video upscaling job"""
         if not request.video_url and not request.video_base64:
             raise HTTPException(status_code=400, detail="Must provide either video_url or video_base64")
 
         job_id = str(uuid.uuid4())
-        gpu_type = "H100" if request.resolution in ['720p', '1080p'] else "H200"
+        gpu_type = "H100" if request.resolution in ["720p", "1080p"] else "H200"
 
-        job_data = {
+        save_job(job_id, {
             "job_id": job_id,
             "status": "pending",
             "created_at": time.time(),
             "gpu_type": gpu_type,
-            "request": request.model_dump()
-        }
-        save_job(job_id, job_data)
+            "request": request.model_dump(),
+        })
 
-        # Start processing in background
+        # run job in background
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
 
         return {
             "job_id": job_id,
             "status": "pending",
             "message": f"Job submitted. Check status: GET /status/{job_id}",
-            "gpu_type": gpu_type
+            "gpu_type": gpu_type,
         }
 
     @web_app.get("/status/{job_id}", response_model=JobStatus)
     async def get_job_status(job_id: str):
-        """Check the status of a job"""
-
-        # Check for real-time progress
-        realtime_progress = None
+        # real-time progress from shared dict
+        realtime = None
         try:
             if job_id in progress_dict:
-                progress_data = progress_dict[job_id]
-                if isinstance(progress_data, dict):
-                    realtime_progress = progress_data.get("text")
-                else:
-                    realtime_progress = progress_data
-        except:
+                pd = progress_dict[job_id]
+                realtime = pd.get("text") if isinstance(pd, dict) else pd
+        except Exception:
             pass
 
         job_data = load_job(job_id)
         if not job_data:
+            if realtime:
+                return JobStatus(job_id=job_id, status="processing", progress=realtime)
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # Use real-time progress if available
-        if realtime_progress:
-            job_data["progress"] = realtime_progress
+        if realtime:
+            job_data["progress"] = realtime
 
         created_at = job_data.get("created_at")
-        elapsed_seconds = None
-        if created_at:
-            elapsed_seconds = time.time() - created_at
+        elapsed = (time.time() - created_at) if created_at else None
 
         return JobStatus(
             job_id=job_id,
-            status=job_data["status"],
+            status=job_data.get("status", "pending"),
             progress=job_data.get("progress"),
-            cdn_url=job_data.get("cdn_url"),
+            download_url=job_data.get("download_url"),  # direct CDN file
             filename=job_data.get("filename"),
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
             error=job_data.get("error"),
-            elapsed_seconds=elapsed_seconds
+            elapsed_seconds=elapsed,
         )
 
     @web_app.get("/")
     async def root():
-        """API root"""
+        # lightweight active count
+        active = 0
+        if os.path.exists(JOBS_DIR):
+            for fn in os.listdir(JOBS_DIR):
+                if fn.endswith(".json"):
+                    try:
+                        with open(f"{JOBS_DIR}/{fn}", "r") as f:
+                            jd = _json.load(f)
+                        if jd.get("status") in ("pending", "processing"):
+                            active += 1
+                    except Exception:
+                        pass
+
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "11.0 - BunnyCDN FTP Storage (Immediate Access)",
+            "version": "4.1 - Bunny Storage (direct URL)",
             "endpoints": {
                 "submit_job": "POST /upscale",
-                "check_status": "GET /status/{job_id}"
+                "check_status": "GET /status/{job_id}",
             },
-            "features": {
-                "bunnycdn_ftp_storage": "Direct FTP upload to storage - no transcoding!",
-                "no_volume_commits": "No more Modal volume blocking issues",
-                "watchdog": "Auto-kills stalled jobs",
-                "real_time_logs": "Live progress updates",
-                "cdn_delivery": "Global CDN for fast downloads"
-            },
-            "note": "Videos are uploaded to BunnyCDN - no download endpoint needed"
+            "active_jobs": active,
         }
 
     return web_app
