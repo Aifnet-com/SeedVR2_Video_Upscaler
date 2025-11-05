@@ -1,57 +1,144 @@
-sequenceDiagram
-    autonumber
-    actor U as User
-    participant C as Client (upscale.sh)
-    participant API as FastAPI (/upscale, /status)
-    participant W as Background Worker (process_video)
-    participant H as Modal GPU (H100/H200)
-    participant P as progress_dict (in-memory)
-    participant J as /outputs/jobs/{job_id}.json
-    participant CDN as BunnyCDN (Storage + CDN URL)
+1. User Submits Job
 
-    %% Submit
-    U->>C: Run upscale.sh (video_url, resolution)
-    C->>API: POST /upscale { video_url, resolution, batch_size }
-    API->>API: Generate job_id, choose GPU (H100/H200)
-    API->>J: Save {status: "pending", gpu_type, created_at}
-    API-->>C: { job_id, gpu_type, status: "pending" }
-    API->>W: spawn process_video(job_id, request)
+The user sends a POST /upscale request:
 
-    %% Status polling
-    loop Poll every ~5s
-        C->>API: GET /status/{job_id}
-        API->>P: read realtime progress (if any)
-        API->>J: read persisted job record (if any)
-        API-->>C: {status, progress, download_url?}
-    end
+{
+  "video_url": "https://...",
+  "resolution": "1080p",
+  "batch_size": 100
+}
 
-    %% Processing
-    W->>H: upscale_video_{h100|h200}.remote()
-    H->>H: Clone repo, download/parse video, calc stall timeout
-    par Streaming logs
-        H-->>P: progress updates (Window/Batch/Time logs)
-        H-->>J: persisted progress (best effort)
-        H-->>API: (readable via /status)
-    and Watchdog
-        H->>H: watchdog: kill if no logs > timeout
-    end
-    H->>H: inference_cli.py (process windows, stitch)
 
-    %% Finalization
-    H->>CDN: Upload output.mp4 (HTTP PUT)
-    H-->>W: { filename, cdn_url, input_size_mb, output_size_mb }
+The FastAPI service responds immediately with:
 
-    %% Complete
-    W->>J: Save { status: "completed", download_url: cdn_url, ... }
-    W->>P: delete progress_dict[job_id]
-    API-->>C: { status: "completed", download_url }
+{
+  "job_id": "abc-123",
+  "gpu_type": "H100",
+  "status": "pending"
+}
 
-    %% Failures
-    opt Failure paths
-        note over H: Watchdog timeout OR non-zero return OR 7200s hard limit
-        H-->>W: raise Exception(...) (with tail logs)
-        W->>J: Save { status: "failed", error, progress }
-        W->>P: delete progress_dict[job_id]
-        API-->>C: { status: "failed", error }
-    end
 
+2. FastAPI Service
+
+Generates a unique job_id.
+
+Determines GPU type:
+
+720p / 1080p → H100
+
+2K / 4K → H200
+
+Saves the job metadata to /outputs/jobs/{job_id}.json.
+
+Spawns a background async task:
+
+asyncio.create_task(process_video(job_id, request))
+
+
+
+3. Background Worker (process_video)
+
+Launches a Modal GPU container by calling one of:
+
+upscale_video_h100.remote()
+
+upscale_video_h200.remote()
+
+Each runs in a prebuilt Modal image with:
+
+PyTorch, CUDA, ffmpeg
+
+/models volume (shared weights)
+
+/outputs volume (temporary output space)
+
+The user can immediately poll GET /status/{job_id}.
+
+
+
+4. GPU Container Workflow (_upscale_video_impl)
+Phase 1: Initialization
+
+Clones the SeedVR2 repo into /tmp.
+
+Downloads or decodes the input video.
+
+Extracts metadata (resolution, FPS, frame count).
+
+Calculates the expected stall timeout based on resolution and batch size.
+
+Phase 2: Processing + Watchdog
+
+Runs inference_cli.py via subprocess.Popen.
+
+Starts a watchdog thread that:
+
+Checks log activity every 10s.
+
+Kills the process if no logs appear for longer than the timeout.
+
+Streams logs in real time to:
+
+Modal console.
+
+progress_dict (for live status updates).
+
+/outputs/jobs/{job_id}.json (for persistence).
+
+Phase 3: Batch Processing
+
+Loads the diffusion + VAE models (~20s).
+
+Processes sequential frame batches:
+
+Example at 1080p: three 100-frame windows (~60s each).
+
+Stitches frames together (crossfade).
+
+Phase 4: Finalization
+
+Saves the result as output.mp4.
+
+Uploads directly to BunnyCDN Storage.
+
+Returns:
+
+{
+  "filename": "abc_1080p_123.mp4",
+  "cdn_url": "https://aifnet.b-cdn.net/tests/seedvr2_results/abc_1080p_123.mp4",
+  "input_size_mb": 0.55,
+  "output_size_mb": 6.49
+}
+
+
+
+5. Status Tracking
+Success Path
+
+Job JSON updated to:
+
+{
+  "status": "completed",
+  "download_url": "https://aifnet.b-cdn.net/tests/seedvr2_results/abc_1080p_123.mp4"
+}
+
+
+Entry removed from progress_dict.
+
+Failure Paths
+Failure Type	Trigger	Result
+Watchdog Timeout	No logs > stall timeout	Process killed, marked as failed
+Process Error	Non-zero return code	Captures last 20 log lines, marked failed
+Modal Timeout	>7200s job limit	Container killed, job failed
+
+
+
+6. GPU Container Shutdown
+
+Process exits (success or failure).
+
+CUDA context destroyed, VRAM freed.
+
+/tmp directories cleaned up.
+
+Container destroyed, GPU becomes available for next job.
