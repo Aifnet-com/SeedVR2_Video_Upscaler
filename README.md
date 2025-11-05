@@ -1,4 +1,4 @@
-1. User Submits Job
+**1. User Submits Job**
 
 The user sends a POST /upscale request:
 
@@ -18,7 +18,7 @@ The FastAPI service responds immediately with:
 }
 
 
-2. FastAPI Service
+**2. FastAPI Service**
 
 Generates a unique job_id.
 
@@ -26,7 +26,7 @@ Determines GPU type:
 
 720p / 1080p → H100
 
-2K / 4K → H200
+2K → H200
 
 Saves the job metadata to /outputs/jobs/{job_id}.json.
 
@@ -36,7 +36,7 @@ asyncio.create_task(process_video(job_id, request))
 
 
 
-3. Background Worker (process_video)
+**3. Background Worker (process_video)**
 
 Launches a Modal GPU container by calling one of:
 
@@ -56,7 +56,8 @@ The user can immediately poll GET /status/{job_id}.
 
 
 
-4. GPU Container Workflow (_upscale_video_impl)
+**4. GPU Container Workflow (_upscale_video_impl)**
+
 Phase 1: Initialization
 
 Clones the SeedVR2 repo into /tmp.
@@ -112,7 +113,7 @@ Returns:
 
 
 
-5. Status Tracking
+**5. Status Tracking**
 Success Path
 
 Job JSON updated to:
@@ -133,7 +134,7 @@ Modal Timeout	>7200s job limit	Container killed, job failed
 
 
 
-6. GPU Container Shutdown
+**6. GPU Container Shutdown**
 
 Process exits (success or failure).
 
