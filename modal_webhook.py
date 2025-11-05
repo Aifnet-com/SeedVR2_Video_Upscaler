@@ -288,8 +288,9 @@ def _upscale_video_impl(
         _update_job_progress(job_id, "🎞️ Re-encoding output with libx264 (CRF 18)...")
         reencoded_path = os.path.join(tmpdir, "output_final.mp4")
 
-        subprocess.run([
-            "ffmpeg", "-y",
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-hide_banner", "-loglevel", "info",
             "-i", output_tmp,
             "-c:v", "libx264",
             "-profile:v", "high",
@@ -299,7 +300,16 @@ def _upscale_video_impl(
             "-preset", "medium",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             reencoded_path
-        ], check=True)
+        ]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in iter(proc.stdout.readline, ''):
+            if line.strip():
+                print("🎬 [ffmpeg]", line.strip())
+        proc.wait(timeout=60)
+
+        if proc.returncode != 0 or not os.path.exists(reencoded_path):
+            raise Exception("❌ ffmpeg re-encode failed or produced no output")
 
         print("✅ Re-encoded successfully with H.264 + faststart")
         output_tmp = reencoded_path
