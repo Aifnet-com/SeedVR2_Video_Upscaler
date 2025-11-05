@@ -47,6 +47,8 @@ image = (
 # Models volume only (final files no longer use a Modal volume)
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
 
+output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True)
+
 # ---------------- Bunny Storage (NOT Video Library) ----------------
 # Zone: aifnet
 BUNNY_HOST = "storage.bunnycdn.com"
@@ -381,7 +383,7 @@ def _upscale_video_impl(
     image=image,
     gpu="H100",
     timeout=7200,
-    volumes={"/models": model_volume},
+    volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
     max_containers=10,
 )
@@ -404,7 +406,7 @@ def upscale_video_h100(
     image=image,
     gpu="H200",
     timeout=7200,
-    volumes={"/models": model_volume},
+    volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
     max_containers=10,
 )
@@ -429,6 +431,7 @@ def upscale_video_h200(
     image=image,
     timeout=7200,
     scaledown_window=60,
+    volumes={"/outputs": output_volume},  # ← add this line
 )
 @modal.asgi_app()
 def fastapi_app():
@@ -439,7 +442,7 @@ def fastapi_app():
     web_app = FastAPI()
 
     # Local job cache (simple; okay since one web app handles status)
-    JOBS_DIR = "/root/jobs"
+    JOBS_DIR = "/outputs/jobs"
     os.makedirs(JOBS_DIR, exist_ok=True)
 
     def save_job(job_id: str, job_data: dict):
