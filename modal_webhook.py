@@ -132,6 +132,7 @@ def _upscale_video_impl(
     """
     import subprocess, tempfile, os, requests, hashlib, time as time_module
     import shutil, cv2, math, threading, signal
+    import urllib.parse
 
     print(f"🚀 Starting SeedVR2 on {gpu_type} @ {resolution}")
     _update_job_progress(job_id, "🚀 Initializing upscaler...")
@@ -358,9 +359,13 @@ def _upscale_video_impl(
         _update_job_progress(job_id, "✅ Uploading to Bunny Storage...")
 
         # -------- Upload to Bunny Storage (DIRECT CDN URL) --------
-        timestamp = int(time_module.time())
-        filename = f"{url_hash}_{resolution}_{timestamp}.mp4"
-        zone_rel_path = f"{BUNNY_ROOT_DIR}/{filename}"  # e.g. tests/seedvr2_results/abc_720p_123.mp4
+        # Derive clean base name from original URL (or fallback to hash)
+        parsed_url = urllib.parse.urlparse(video_url)
+        base_name = os.path.basename(parsed_url.path) or f"video_{url_hash}.mp4"
+        name_root, _ = os.path.splitext(base_name)
+
+        filename = f"{name_root}_{resolution}.mp4"
+        zone_rel_path = f"{BUNNY_ROOT_DIR}/{filename}"
         cdn_url = upload_to_bunny_storage(output_tmp, zone_rel_path)
         print(f"✅ Uploaded to Bunny Storage: {cdn_url}")
 
