@@ -282,6 +282,29 @@ def _upscale_video_impl(
         if not os.path.exists(output_tmp):
             raise Exception("Output file not created")
 
+        # ------------------------------------------------------------------
+        # ✅ Re-encode with H.264 for optimal quality & web playback
+        # ------------------------------------------------------------------
+        _update_job_progress(job_id, "🎞️ Re-encoding output with libx264 (CRF 18)...")
+        reencoded_path = os.path.join(tmpdir, "output_final.mp4")
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", output_tmp,
+            "-c:v", "libx264",
+            "-profile:v", "high",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-preset", "medium",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            reencoded_path
+        ], check=True)
+
+        print("✅ Re-encoded successfully with H.264 + faststart")
+        output_tmp = reencoded_path
+        # ------------------------------------------------------------------
+
         output_size_mb = os.path.getsize(output_tmp) / (1024 * 1024)
         _update_job_progress(job_id, "✅ Uploading to Bunny Storage...")
 
@@ -303,6 +326,7 @@ def _upscale_video_impl(
         "output_size_mb": output_size_mb,
         "cdn_url": cdn_url,   # direct file URL
     }
+
 
 # ---------------- GPU wrappers ----------------
 
