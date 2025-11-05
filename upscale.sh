@@ -40,32 +40,28 @@ RESPONSE=$(curl -s -X POST "$API_URL/upscale" \
   -H "Content-Type: application/json" \
   -d "$REQUEST_BODY")
 
-JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id' 2>/dev/null)
+JOB_ID=$(echo $RESPONSE | jq -r '.job_id' 2>/dev/null)
 
 if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
     echo "❌ Failed to submit job"
-    echo "$RESPONSE" | jq 2>/dev/null || echo "$RESPONSE"
+    echo $RESPONSE | jq 2>/dev/null || echo $RESPONSE
     exit 1
 fi
 
 echo "✅ Job submitted: $JOB_ID"
 
 # Extract and display GPU type
-GPU_TYPE=$(echo "$RESPONSE" | jq -r '.gpu_type' 2>/dev/null)
+GPU_TYPE=$(echo $RESPONSE | jq -r '.gpu_type' 2>/dev/null)
 if [ -n "$GPU_TYPE" ] && [ "$GPU_TYPE" != "null" ]; then
     echo "🖥️  GPU: $GPU_TYPE"
 fi
 
-# Generate output filename
-SHORT_ID=${JOB_ID:0:8}
-OUTPUT_FILE="upscaled_${SHORT_ID}.mp4"
-echo "📁 Output will be saved to: $OUTPUT_FILE"
 echo ""
 
 # Poll status
 while true; do
     STATUS=$(curl -s "$API_URL/status/$JOB_ID")
-    STATE=$(echo "$STATUS" | jq -r '.status' 2>/dev/null)
+    STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
 
     # Handle initial sync delay (404s)
     if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
@@ -74,54 +70,30 @@ while true; do
         continue
     fi
 
-    ELAPSED=$(echo "$STATUS" | jq -r '.elapsed_seconds')
-    PROGRESS=$(echo "$STATUS" | jq -r '.progress')
+    ELAPSED=$(echo $STATUS | jq -r '.elapsed_seconds')
+    PROGRESS=$(echo $STATUS | jq -r '.progress')
 
     if [ "$STATE" = "completed" ]; then
-        # Clear the progress line and move to new line
         printf "\r\033[K"
         echo ""
         echo "✅ Job completed!"
-        DOWNLOAD_URL=$(echo "$STATUS" | jq -r '.download_url')
-        OUTPUT_SIZE=$(echo "$STATUS" | jq -r '.output_size_mb')
+        DOWNLOAD_URL=$(echo $STATUS | jq -r '.download_url')
+        OUTPUT_SIZE=$(echo $STATUS | jq -r '.output_size_mb')
         echo "📊 Output: ${OUTPUT_SIZE} MB"
         echo ""
-
-        if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-            echo "❌ Backend did not return a download URL"
-            echo "$STATUS" | jq 2>/dev/null || echo "$STATUS"
-            exit 1
-        fi
-
-        echo "📥 Downloading..."
-        echo "🔗 $DOWNLOAD_URL"
-        # Robust download (follow redirects, fail on HTTP error, retry a bit)
-        curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
-          "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
-
-        if [ -f "$OUTPUT_FILE" ]; then
-            FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
-            echo "✅ Saved to: $OUTPUT_FILE ($FILE_SIZE)"
-            echo "⏱️  Total time: ${ELAPSED} seconds"
-            echo "Upscaled_url: $DOWNLOAD_URL"
-        else
-            echo "❌ Download failed"
-            exit 1
-        fi
+        echo "Upscaled_url: ${DOWNLOAD_URL}"
+        echo "⏱️  Total time: ${ELAPSED} seconds"
         break
 
     elif [ "$STATE" = "failed" ]; then
-        # Clear the progress line
         printf "\r\033[K"
-        ERROR=$(echo "$STATUS" | jq -r '.error')
+        ERROR=$(echo $STATUS | jq -r '.error')
         echo "❌ Job failed: $ERROR"
         exit 1
 
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
-
-        # Clear line, then print status (all in one printf to avoid flicker)
         printf "\r\033[K⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
     fi
 
