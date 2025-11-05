@@ -311,8 +311,45 @@ def _upscale_video_impl(
         if proc.returncode != 0 or not os.path.exists(reencoded_path):
             raise Exception("❌ ffmpeg re-encode failed or produced no output")
 
-        print("✅ Re-encoded successfully with H.264 + faststart")
-        output_tmp = reencoded_path
+        print("✅ Re-encoded successfully with H.264 + faststart", flush=True)
+
+        # ------------------------------------------------------------------
+        # 🎧 Merge original audio (if exists) back into the upscaled video
+        # ------------------------------------------------------------------
+        _update_job_progress(job_id, "🎧 Restoring original audio track...")
+        audio_path = os.path.join(tmpdir, "audio.m4a")
+        merged_path = os.path.join(tmpdir, "output_final_audio.mp4")
+
+        # Extract audio safely
+        extract_cmd = [
+            "ffmpeg", "-y", "-nostdin", "-hide_banner",
+            "-i", input_path, "-vn", "-acodec", "copy", audio_path
+        ]
+        subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Merge only if audio was extracted successfully
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024:
+            merge_cmd = [
+                "ffmpeg", "-y", "-nostdin", "-hide_banner",
+                "-i", reencoded_path,
+                "-i", audio_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                merged_path
+            ]
+            proc = subprocess.Popen(merge_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in iter(proc.stdout.readline, ''):
+                if line.strip():
+                    print("🎬 [audio merge]", line.strip())
+            proc.wait(timeout=300)
+            if proc.returncode != 0 or not os.path.exists(merged_path):
+                print("⚠️ Audio merge failed, keeping video-only output")
+            else:
+                print("✅ Audio merged successfully", flush=True)
+                output_tmp = merged_path
+        else:
+            print("ℹ️ No audio track found or extraction failed, skipping merge")
         # ------------------------------------------------------------------
 
         output_size_mb = os.path.getsize(output_tmp) / (1024 * 1024)
