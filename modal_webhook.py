@@ -79,7 +79,7 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
     zone_rel_path is path *inside* the zone (e.g. "tests/seedvr2_results/foo.mp4").
     Returns the CDN URL: https://<base_url>/<zone_rel_path>
     """
-    import requests, time as _t
+    import requests, time as _t, os
 
     host, zone, accesskey, base_url, _root = _bunny_cfg()
 
@@ -92,19 +92,30 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
         "Connection": "close",
     }
 
+    # Calculate reasonable timeout based on file size
+    # Assume minimum 5MB/s upload speed, with 2x buffer
+    file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+    upload_timeout = max(60, min(int(file_size_mb / 5) * 2, 180))  # 60-180s range
+
+    print(f"📤 Uploading {file_size_mb:.1f}MB (timeout: {upload_timeout}s)")
+
     for attempt in range(3):
         try:
             with open(local_path, "rb") as f:
-                resp = requests.put(url, headers=headers, data=f, timeout=600)
+                resp = requests.put(url, headers=headers, data=f, timeout=upload_timeout)
             if resp.status_code in (200, 201):
                 return f"{base_url}/{zone_rel_path}"
             else:
                 print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:300]}")
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Upload timeout after {upload_timeout}s (attempt {attempt+1}/3)")
         except Exception as e:
             print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
-        _t.sleep(3 * (attempt + 1))
 
-    raise Exception("Bunny upload failed after 3 attempts")
+        if attempt < 2:  # Don't sleep after last attempt
+            _t.sleep(5 * (attempt + 1))  # 5s, 10s
+
+    raise Exception(f"Bunny upload failed after 3 attempts (file: {file_size_mb:.1f}MB)")
 
 # ---------------- Fallback helpers (CDN probing) ----------------
 
@@ -158,7 +169,7 @@ def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
     upload_time = max(5, int(frames / 100.0 * 2))
 
     total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
-    return int(total * 1.25)  # 25% safety margin
+    return int(total * 1.50)  # 25% safety margin
 
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
@@ -454,6 +465,11 @@ def _upscale_video_impl(
         cdn_url = upload_to_bunny_storage(output_tmp, zone_rel_path)
         print(f"✅ Uploaded to Bunny Storage: {cdn_url}")
 
+        # 🔑 CRITICAL: Store success in progress_dict so fallback can detect completion!
+        # Even if .remote() hangs before returning, fallback thread can parse this
+        _update_job_progress(job_id, f"✅ UPLOAD_SUCCESS: {cdn_url}")
+
+
     # Cleanup repo
     os.chdir("/root")
     import shutil as _sh
@@ -600,37 +616,88 @@ def fastapi_app():
                 # Quick probe to estimate frames -> ETA
                 meta = probe_video_meta(request.video_url) if request.video_url else None
                 frames = (meta or {}).get("frames", 300)  # default ≈ 12s @ 25fps
-                eta = max(estimate_eta_seconds(frames, request.resolution), 60)  # at least 60s
+                eta = max(estimate_eta_seconds(frames, request.resolution), 90)  # at least 90s
 
-                # Wait ETA, then try up to 3 times, 10s apart
-                _t.sleep(eta)
-                for _ in range(3):
+                # Start checking at 80% of ETA
+                initial_wait = int(eta * 0.8)
+                _t.sleep(initial_wait)
+
+                # Then check every 20s for up to 5 minutes (15 attempts)
+                for attempt in range(15):
+                    # Check 1: Parse progress_dict for upload success marker
+                    try:
+                        progress_data = progress_dict.get(job_id, {})
+                        progress_text = progress_data.get("text", "") if isinstance(progress_data, dict) else str(progress_data)
+
+                        # Look for our success marker
+                        if "UPLOAD_SUCCESS:" in progress_text:
+                            # Extract CDN URL from progress text
+                            cdn_url_from_progress = progress_text.split("UPLOAD_SUCCESS:")[-1].strip()
+
+                            job_data = load_job(job_id) or {}
+
+                            # Don't overwrite if already completed
+                            if job_data.get("status") == "completed":
+                                print(f"✅ Fallback: Job already completed, skipping")
+                                return
+
+                            job_data.update({
+                                "status": "completed",
+                                "progress": "✅ Completed via fallback (progress_dict detection)",
+                                "download_url": cdn_url_from_progress,
+                                "filename": expected_filename,
+                                "output_size_mb": None,  # Will be filled by status endpoint if needed
+                                "fallback_completed": True,  # Flag to prevent main thread overwrite
+                            })
+                            save_job(job_id, job_data)
+                            print(f"✅ Fallback: Detected upload success in progress_dict: {cdn_url_from_progress}")
+                            try:
+                                if job_id in progress_dict:
+                                    del progress_dict[job_id]
+                            except Exception:
+                                pass
+                            return
+                    except Exception as e:
+                        print(f"⚠️ Fallback: Error checking progress_dict: {e}")
+
+                    # Check 2: CDN file exists
                     ok, size = cdn_file_exists(expected_cdn_url)
                     if ok:
                         job_data = load_job(job_id) or {}
+
+                        # Don't overwrite if already completed
+                        if job_data.get("status") == "completed":
+                            print(f"✅ Fallback: Job already completed, skipping")
+                            return
+
                         job_data.update({
                             "status": "completed",
-                            "progress": "✅ Completed via fallback check",
+                            "progress": "✅ Completed via fallback (CDN file detection)",
                             "download_url": expected_cdn_url,
-                            "filename": filename,
+                            "filename": expected_filename,
                             "output_size_mb": size / (1024 * 1024) if size else None,
+                            "fallback_completed": True,
                         })
                         save_job(job_id, job_data)
-                        print(f"✅ Fallback: Found CDN file {expected_cdn_url}, marking completed")
+                        print(f"✅ Fallback: Found CDN file {expected_cdn_url} ({size} bytes)")
                         try:
                             if job_id in progress_dict:
                                 del progress_dict[job_id]
                         except Exception:
                             pass
                         return
-                    print(f"⚠️ Fallback: file not found yet, retrying in 10s ({_ + 1}/3)")
-                    _t.sleep(10)
 
-                # After 3 unsuccessful retries:
+                    elapsed_total = initial_wait + (attempt * 20)
+                    print(f"⚠️ Fallback check {attempt+1}/15: No success marker yet ({elapsed_total}s elapsed)")
+
+                    if attempt < 14:  # Don't sleep after last attempt
+                        _t.sleep(20)
+
+                # After all retries failed
                 job_data = load_job(job_id) or {}
                 job_data.update({
                     "status": "failed",
-                    "error": "❌ Fallback timeout: output file not found on BunnyCDN after retries",
+                    "error": "❌ Fallback timeout: output file not found after extended checks",
                     "progress": "❌ Job failed: output file missing on CDN",
                 })
                 save_job(job_id, job_data)
@@ -640,6 +707,7 @@ def fastapi_app():
                 except Exception:
                     pass
                 print("❌ Fallback: job failed - output file never appeared on CDN")
+
 
             _thread.Thread(target=fallback_complete, daemon=True).start()
             # === end fallback ===
@@ -670,6 +738,12 @@ def fastapi_app():
 
             # Persist results (normal completion)
             job_data = load_job(job_id) or {}
+
+            # 🔑 Race condition protection: Don't overwrite if fallback already completed
+            if job_data.get("fallback_completed"):
+                print(f"✅ Main thread: Job already completed by fallback, skipping save")
+                return
+
             job_data.update({
                 "status": "completed",
                 "download_url": res["cdn_url"],   # direct CDN file
