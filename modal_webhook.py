@@ -102,7 +102,7 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
                 print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:300]}")
         except Exception as e:
             print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
-        _t.sleep(2 * (attempt + 1))
+        _t.sleep(3 * (attempt + 1))
 
     raise Exception("Bunny upload failed after 3 attempts")
 
@@ -145,12 +145,20 @@ def probe_video_meta(url: str):
     except Exception:
         return None
 
-def estimate_eta_seconds(frames: int, resolution: str):
-    # Empirical secs per 100 frames (based on earlier measurements)
-    per100 = {"720p": 75, "1080p": 105, "2k": 180, "4k": 375}
-    t = per100.get(resolution, 70) * (frames / 100.0)
-    # Buffer for model load, re-encode, upload, etc.
-    return int(t + 40)
+
+def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
+    per100_gpu = {"720p": 60, "1080p": 65, "2k": 120, "4k": 250}
+    base_gpu = per100_gpu.get(resolution, 65)
+    num_batches = max(1, int((frames + batch_size - 1) / batch_size))
+
+    gpu_time = base_gpu * (frames / 100.0)
+    model_reload_time = 45 + (15 * max(0, num_batches - 1))
+    stitch_time = 2 * max(0, num_batches - 1)
+    save_encode_time = (3.5 * (frames / 100.0)) + 10
+    upload_time = max(5, int(frames / 100.0 * 2))
+
+    total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
+    return int(total * 1.25)  # 25% safety margin
 
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
