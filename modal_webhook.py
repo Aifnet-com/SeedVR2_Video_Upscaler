@@ -106,6 +106,64 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
 
     raise Exception("Bunny upload failed after 3 attempts")
 
+# ---------------- Fallback helpers (CDN probing) ----------------
+
+def derive_output_paths(video_url: str, resolution: str):
+    """Return (filename, zone_rel_path, cdn_url) based on input URL + resolution."""
+    import os, urllib.parse
+    _, _, _, base_url, root_dir = _bunny_cfg()
+    parsed = urllib.parse.urlparse(video_url or "")
+    base = os.path.basename(parsed.path) or "video.mp4"
+    name_root, _ = os.path.splitext(base)
+    filename = f"{name_root}_{resolution}.mp4"
+    zone_rel_path = f"{root_dir}/{filename}"
+    cdn_url = f"{base_url}/{zone_rel_path}"
+    return filename, zone_rel_path, cdn_url
+
+def probe_video_meta(url: str):
+    """Use ffprobe on the remote input URL to estimate duration/fps/frames (no full download)."""
+    import subprocess, json as _json
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate:format=duration",
+                "-of", "json",
+                url,
+            ],
+            text=True,
+            timeout=20,
+        )
+        data = _json.loads(out)
+        dur = float(data["format"]["duration"])
+        fr = data["streams"][0]["avg_frame_rate"]  # e.g., "25/1"
+        n, d = fr.split("/")
+        fps = float(n) / float(d or 1)
+        frames = max(1, int(round(dur * fps)))
+        return {"duration": dur, "fps": fps, "frames": frames}
+    except Exception:
+        return None
+
+def estimate_eta_seconds(frames: int, resolution: str):
+    # Empirical secs per 100 frames (based on earlier measurements)
+    per100 = {"720p": 75, "1080p": 105, "2k": 180, "4k": 375}
+    t = per100.get(resolution, 70) * (frames / 100.0)
+    # Buffer for model load, re-encode, upload, etc.
+    return int(t + 40)
+
+def cdn_file_exists(cdn_url: str):
+    """HEAD the CDN URL; return (exists, size_bytes)."""
+    import requests
+    try:
+        r = requests.head(cdn_url, timeout=10)
+        if r.status_code == 200:
+            size = int(r.headers.get("Content-Length", "0") or 0)
+            return True, size
+    except Exception:
+        pass
+    return False, 0
+
 # ---------------- Utility: progress + timeout heuristics ----------------
 
 def _update_job_progress(job_id: str, progress_text: str):
@@ -465,6 +523,7 @@ def fastapi_app():
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
     import time, uuid, os, asyncio, json as _json
+    import threading as _thread
 
     web_app = FastAPI()
 
@@ -522,7 +581,50 @@ def fastapi_app():
             job_data.update({"status": "processing", "progress": "Starting upscaler..."})
             save_job(job_id, job_data)
 
-            # Choose GPU
+            # === Fallback completion thread (backup path if logs or updates stall) ===
+            # Determine expected CDN URL upfront
+            expected_filename, _expected_zone_rel, expected_cdn_url = derive_output_paths(
+                request.video_url or "", request.resolution
+            )
+
+            def fallback_complete():
+                import time as _t
+                # Quick probe to estimate frames -> ETA
+                meta = probe_video_meta(request.video_url) if request.video_url else None
+                frames = (meta or {}).get("frames", 300)  # default ≈ 12s @ 25fps
+                eta = max(estimate_eta_seconds(frames, request.resolution), 60)  # at least 60s
+
+                # Wait ETA, then try up to 3 times, 10s apart
+                _t.sleep(eta)
+                for _ in range(3):
+                    jd = load_job(job_id) or {}
+                    if jd.get("status") in ("completed", "failed"):
+                        return  # nothing to do
+
+                    ok, size = cdn_file_exists(expected_cdn_url)
+                    if ok:
+                        # Complete the job via fallback
+                        jd.update({
+                            "status": "completed",
+                            "download_url": expected_cdn_url,
+                            "filename": expected_filename,
+                            "output_size_mb": round(size / (1024 * 1024), 3) if size else jd.get("output_size_mb"),
+                            "progress": "✅ Completed via fallback (CDN detected).",
+                        })
+                        save_job(job_id, jd)
+                        try:
+                            if job_id in progress_dict:
+                                del progress_dict[job_id]
+                        except Exception:
+                            pass
+                        return
+
+                    _t.sleep(10)
+
+            _thread.Thread(target=fallback_complete, daemon=True).start()
+            # === end fallback ===
+
+            # Choose GPU (normal path)
             if request.resolution in ["720p", "1080p"]:
                 res = upscale_video_h100.remote(
                     video_url=request.video_url,
@@ -546,7 +648,7 @@ def fastapi_app():
                     job_id=job_id,
                 )
 
-            # Persist results
+            # Persist results (normal completion)
             job_data = load_job(job_id) or {}
             job_data.update({
                 "status": "completed",
@@ -653,7 +755,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "4.1 - Bunny Storage (direct URL)",
+            "version": "4.2 - Bunny Storage (direct URL) + CDN fallback",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
