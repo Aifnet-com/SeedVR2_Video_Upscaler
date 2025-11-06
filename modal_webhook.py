@@ -597,29 +597,41 @@ def fastapi_app():
                 # Wait ETA, then try up to 3 times, 10s apart
                 _t.sleep(eta)
                 for _ in range(3):
-                    jd = load_job(job_id) or {}
-                    if jd.get("status") in ("completed", "failed"):
-                        return  # nothing to do
-
                     ok, size = cdn_file_exists(expected_cdn_url)
                     if ok:
-                        # Complete the job via fallback
-                        jd.update({
+                        job_data = load_job(job_id) or {}
+                        job_data.update({
                             "status": "completed",
+                            "progress": "✅ Completed via fallback check",
                             "download_url": expected_cdn_url,
-                            "filename": expected_filename,
-                            "output_size_mb": round(size / (1024 * 1024), 3) if size else jd.get("output_size_mb"),
-                            "progress": "✅ Completed via fallback (CDN detected).",
+                            "filename": filename,
+                            "output_size_mb": size / (1024 * 1024) if size else None,
                         })
-                        save_job(job_id, jd)
+                        save_job(job_id, job_data)
+                        print(f"✅ Fallback: Found CDN file {expected_cdn_url}, marking completed")
                         try:
                             if job_id in progress_dict:
                                 del progress_dict[job_id]
                         except Exception:
                             pass
                         return
-
+                    print(f"⚠️ Fallback: file not found yet, retrying in 10s ({_ + 1}/3)")
                     _t.sleep(10)
+
+                # After 3 unsuccessful retries:
+                job_data = load_job(job_id) or {}
+                job_data.update({
+                    "status": "failed",
+                    "error": "❌ Fallback timeout: output file not found on BunnyCDN after retries",
+                    "progress": "❌ Job failed: output file missing on CDN",
+                })
+                save_job(job_id, job_data)
+                try:
+                    if job_id in progress_dict:
+                        del progress_dict[job_id]
+                except Exception:
+                    pass
+                print("❌ Fallback: job failed - output file never appeared on CDN")
 
             _thread.Thread(target=fallback_complete, daemon=True).start()
             # === end fallback ===
