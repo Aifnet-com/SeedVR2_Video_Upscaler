@@ -7,14 +7,18 @@ SeedVR2 Upscaler (Modal + FastAPI)
 - Status returns a DIRECT CDN URL (no Modal volume commits)
 """
 
+import os
+import json
 import modal
 from typing import Optional
-import json
 
 # ---------------- Modal app & shared state ----------------
 
 app = modal.App("seedvr2-upscaler")
 progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
+
+# Bunny secret (created in Modal UI as "bunnycdn_storage")
+bunny_secret = modal.Secret.from_name("bunnycdn_storage")
 
 # Base image & deps
 image = (
@@ -44,33 +48,46 @@ image = (
     )
 )
 
-# Models volume only (final files no longer use a Modal volume)
+# Volumes
 model_volume = modal.Volume.from_name("seedvr2-models", create_if_missing=True)
-
 output_volume = modal.Volume.from_name("seedvr2-outputs", create_if_missing=True)
 
-# ---------------- Bunny Storage (NOT Video Library) ----------------
-# Zone: aifnet
-BUNNY_HOST = "storage.bunnycdn.com"
-BUNNY_STORAGE_ZONE = "aifnet"  # storage zone name
-BUNNY_STORAGE_KEY = "bdb5e5c4-9935-4951-a41a89f7971f-0249-4cdf"  # Storage Zone FTP/API password
-BUNNY_BASE_URL = "https://aifnet.b-cdn.net"
-# Path INSIDE the zone (do NOT include the zone name again)
-BUNNY_ROOT_DIR = "tests/seedvr2_results"
+# ---------------- Bunny Storage via Secret ----------------
+
+def _bunny_cfg():
+    """
+    Pull Bunny settings from the Modal secret injected as env vars.
+    Required keys in secret:
+      - BUNNY_STORAGE_ZONE    (e.g. "aifnet")
+      - BUNNY_STORAGE_KEY     (Storage zone AccessKey)
+      - BUNNY_BASE_URL        (e.g. "https://aifnet.b-cdn.net")
+      - BUNNY_ROOT_DIR        (e.g. "tests/seedvr2_results")
+    Optional:
+      - BUNNY_HOST            (default "storage.bunnycdn.com")
+    """
+    zone = os.environ["BUNNY_STORAGE_ZONE"]
+    accesskey = os.environ["BUNNY_STORAGE_KEY"]
+    base_url = os.environ["BUNNY_BASE_URL"]
+    root_dir = os.environ["BUNNY_ROOT_DIR"]
+    host = os.environ.get("BUNNY_HOST", "storage.bunnycdn.com")
+    return host, zone, accesskey, base_url, root_dir
+
 
 def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
     """
     Upload to Bunny Storage via HTTPS PUT with AccessKey header.
     zone_rel_path is path *inside* the zone (e.g. "tests/seedvr2_results/foo.mp4").
-    Returns the CDN URL: https://aifnet.b-cdn.net/<zone_rel_path>
+    Returns the CDN URL: https://<base_url>/<zone_rel_path>
     """
     import requests, time as _t
 
+    host, zone, accesskey, base_url, _root = _bunny_cfg()
+
     zone_rel_path = zone_rel_path.lstrip("/")
-    url = f"https://{BUNNY_HOST}/{BUNNY_STORAGE_ZONE}/{zone_rel_path}"
+    url = f"https://{host}/{zone}/{zone_rel_path}"
 
     headers = {
-        "AccessKey": BUNNY_STORAGE_KEY,
+        "AccessKey": accesskey,
         "Content-Type": "application/octet-stream",
         "Connection": "close",
     }
@@ -80,7 +97,7 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
             with open(local_path, "rb") as f:
                 resp = requests.put(url, headers=headers, data=f, timeout=600)
             if resp.status_code in (200, 201):
-                return f"{BUNNY_BASE_URL}/{zone_rel_path}"
+                return f"{base_url}/{zone_rel_path}"
             else:
                 print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:300]}")
         except Exception as e:
@@ -364,6 +381,8 @@ def _upscale_video_impl(
         base_name = os.path.basename(parsed_url.path) or f"video_{url_hash}.mp4"
         name_root, _ = os.path.splitext(base_name)
 
+        # Final filename: <original>_<resolution>.mp4
+        _, _, _, _BUNNY_BASE_URL, BUNNY_ROOT_DIR = _bunny_cfg()
         filename = f"{name_root}_{resolution}.mp4"
         zone_rel_path = f"{BUNNY_ROOT_DIR}/{filename}"
         cdn_url = upload_to_bunny_storage(output_tmp, zone_rel_path)
@@ -388,6 +407,7 @@ def _upscale_video_impl(
     image=image,
     gpu="H100",
     timeout=7200,
+    secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
     max_containers=10,
@@ -411,6 +431,7 @@ def upscale_video_h100(
     image=image,
     gpu="H200",
     timeout=7200,
+    secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
     max_containers=10,
@@ -435,8 +456,9 @@ def upscale_video_h200(
 @app.function(
     image=image,
     timeout=7200,
+    secrets=[bunny_secret],
     scaledown_window=60,
-    volumes={"/outputs": output_volume},  # ← add this line
+    volumes={"/outputs": output_volume},
 )
 @modal.asgi_app()
 def fastapi_app():
