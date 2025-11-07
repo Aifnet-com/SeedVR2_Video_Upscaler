@@ -147,19 +147,21 @@ def probe_video_meta(url: str):
 
 
 def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
-    # Corrected based on actual H100 measurements (300 frames @ 1080p = 435s actual)
-    per100_gpu = {"720p": 60, "1080p": 67, "2k": 120, "4k": 250}  # Updated 1080p: 65→67
+    # Corrected based on actual H100 measurements (720 frames @ 1080p = 928s actual)
+    per100_gpu = {"720p": 60, "1080p": 67, "2k": 120, "4k": 250}
     base_gpu = per100_gpu.get(resolution, 67)
     num_batches = max(1, int((frames + batch_size - 1) / batch_size))
 
     gpu_time = base_gpu * (frames / 100.0)
-    model_reload_time = 45 + (12 * max(0, num_batches - 1))  # Updated: 15→12s per reload
+    model_reload_time = 45 + (24 * max(0, num_batches - 1))  # Updated: 12→24s per reload (actual measured)
     stitch_time = 2 * max(0, num_batches - 1)
-    save_encode_time = (3.5 * (frames / 100.0)) + 10
-    upload_time = max(5, int(frames / 100.0 * 2))
+
+    # Post-processing scales with video length (per-batch basis for better accuracy)
+    save_encode_time = (5.0 * num_batches) + 15  # ~5s per batch + fixed overhead
+    upload_time = max(8, int(frames / 100.0 * 3))  # Scales with file size
 
     total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
-    return int(total * 1.35)  # Updated: 50%→35% margin (more accurate)
+    return int(total * 1.35)  # 35% safety margin
 
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
@@ -658,14 +660,14 @@ def fastapi_app():
 
         print(f"🔄 Fallback started for {job_id}, ETA {eta}s ({eta/60:.1f}min)")
 
-        # Start checking at 70% of ETA to handle early completions
-        initial_wait = int(eta * 0.70)
+        # Start checking at 60% of ETA to handle early completions and variance
+        initial_wait = int(eta * 0.60)
         _t.sleep(initial_wait)
 
-        # Check 15 times at 20s intervals = 280s window
-        # This provides ~20-30% variance coverage depending on job size
-        num_checks = 15
-        check_interval = 20
+        # Check 20 times at 25s intervals = 500s window
+        # This provides robust coverage for timing variance
+        num_checks = 20
+        check_interval = 25
 
         for attempt in range(num_checks):
             # Check 1: progress_dict for success marker
