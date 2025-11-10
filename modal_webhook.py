@@ -852,50 +852,8 @@ def fastapi_app():
         job_data = load_job(job_id)
         if not job_data:
             if realtime:
-                rt_lower = str(realtime).lower()
-                if "upload complete:" in rt_lower:
-                    try:
-                        # Parse URL from either exact-case or any-case text
-                        # Prefer splitting on the canonical capitalized version if present
-                        marker = "Upload complete:"
-                        raw = str(realtime)
-                        cdn_url = raw.split(marker, 1)[-1].strip() if marker in raw else \
-                        raw.split("upload complete:", 1)[-1].strip()
-
-                        # Extract filename defensively
-                        filename = cdn_url.rsplit("/", 1)[-1] if "/" in cdn_url else "output.mp4"
-
-                        job_data = load_job(job_id) or {}
-                        job_data.update({
-                            "status": "completed",
-                            "download_url": cdn_url,
-                            "filename": filename,
-                            "progress": "✅ Completed (auto-detected from progress)"
-                        })
-                        save_job(job_id, job_data)
-
-                        # Clear progress_dict so the client won't see stale "processing"
-                        try:
-                            if job_id in progress_dict:
-                                del progress_dict[job_id]
-                        except Exception:
-                            pass
-
-                        created_at = job_data.get("created_at")
-                        elapsed = (time.time() - created_at) if created_at else None
-                        return JobStatus(
-                            job_id=job_id,
-                            status="completed",
-                            progress=job_data.get("progress"),
-                            download_url=job_data.get("download_url"),
-                            filename=job_data.get("filename"),
-                            input_size_mb=job_data.get("input_size_mb"),
-                            output_size_mb=job_data.get("output_size_mb"),
-                            error=job_data.get("error"),
-                            elapsed_seconds=elapsed,
-                        )
-                    except Exception as e:
-                        print(f"⚠️ Early auto-complete parse error: {e}")
+                return JobStatus(job_id=job_id, status="processing", progress=realtime)
+            raise HTTPException(status_code=404, detail="Job not found")
 
         # === Upload Watchdog: If stuck on "Uploading..." for >90s, check CDN ===
         if job_data.get("status") in ("pending", "processing"):
