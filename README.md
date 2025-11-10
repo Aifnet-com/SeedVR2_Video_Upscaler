@@ -159,7 +159,7 @@ CUDA context destroyed, VRAM freed.
 
 Container destroyed, GPU becomes available for next job.
 
-## 🚀 7. Backup Logic (Fail-Safe Completion)
+## 7. Backup Logic (Fail-Safe Completion)
 
 When a job’s logs stop updating, a **fallback thread** ensures completion by checking if the output appears on BunnyCDN.
 
