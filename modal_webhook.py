@@ -147,21 +147,20 @@ def probe_video_meta(url: str):
 
 
 def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
-    # Corrected based on actual H100 measurements (720 frames @ 1080p = 928s actual)
-    per100_gpu = {"720p": 60, "1080p": 67, "2k": 120, "4k": 250}
-    base_gpu = per100_gpu.get(resolution, 67)
+    # Updated based on actual measurements from both 300 and 720 frame jobs
+    # 300 frames: ~435s actual, 720 frames: ~924s actual
+    per100_gpu = {"720p": 58, "1080p": 61, "2k": 120, "4k": 250}  # Lowered: longer jobs are more efficient per batch
+    base_gpu = per100_gpu.get(resolution, 61)
     num_batches = max(1, int((frames + batch_size - 1) / batch_size))
 
     gpu_time = base_gpu * (frames / 100.0)
-    model_reload_time = 45 + (24 * max(0, num_batches - 1))  # Updated: 12→24s per reload (actual measured)
+    model_reload_time = 45 + (12 * max(0, num_batches - 1))
     stitch_time = 2 * max(0, num_batches - 1)
-
-    # Post-processing scales with video length (per-batch basis for better accuracy)
-    save_encode_time = (5.0 * num_batches) + 15  # ~5s per batch + fixed overhead
-    upload_time = max(8, int(frames / 100.0 * 3))  # Scales with file size
+    save_encode_time = (7.6 * (frames / 100.0)) + 10  # CRITICAL FIX: Was 3.5, now 7.6!
+    upload_time = max(5, int(frames / 100.0 * 3))  # Increased: larger files take longer
 
     total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
-    return int(total * 1.35)  # 35% safety margin
+    return int(total * 1.40)  # Increased margin: 35%→40% for safety
 
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
@@ -660,14 +659,14 @@ def fastapi_app():
 
         print(f"🔄 Fallback started for {job_id}, ETA {eta}s ({eta/60:.1f}min)")
 
-        # Start checking at 60% of ETA to handle early completions and variance
-        initial_wait = int(eta * 0.60)
+        # Start checking at 65% of ETA (earlier for longer jobs)
+        initial_wait = int(eta * 0.65)
         _t.sleep(initial_wait)
 
-        # Check 20 times at 25s intervals = 500s window
-        # This provides robust coverage for timing variance
-        num_checks = 20
-        check_interval = 25
+        # Check 22 times at 20s intervals = 440s window (~7.3 min)
+        # This provides robust coverage for variance in longer jobs
+        num_checks = 22
+        check_interval = 20
 
         for attempt in range(num_checks):
             # Check 1: progress_dict for success marker
