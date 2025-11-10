@@ -1,4 +1,19 @@
-**1. User Submits Job**
+# Seedvr2 video upscaling on Modal
+
+Deploying on modal:
+modal deploy modal_webhook.py
+
+Submitting a job:
+git clone https://github.com/Aifnet-com/SeedVR2_Video_Upscaler.git
+cd SeedVR2_Video_Upscaler
+bash upscale.sh "video_url" --resolution 720p/1080p/2k
+
+Test command:
+
+bash upscale.sh "https://aifnet.b-cdn.net/tests/test_video_upscaler/dollars_first_8sec/gladi_3s.mp4" --resolution 1080p
+
+
+## 1. User Submits Job
 
 The user sends a POST /upscale request:
 
@@ -18,7 +33,7 @@ The FastAPI service responds immediately with:
 }
 
 
-**2. FastAPI Service**
+## 2. FastAPI Service
 
 Generates a unique job_id.
 
@@ -36,7 +51,7 @@ asyncio.create_task(process_video(job_id, request))
 
 
 
-**3. Background Worker (process_video)**
+## 3. Background Worker (process_video)
 
 Launches a Modal GPU container by calling one of:
 
@@ -56,7 +71,7 @@ The user can immediately poll GET /status/{job_id}.
 
 
 
-**4. GPU Container Workflow (_upscale_video_impl)**
+## 4. GPU Container Workflow (_upscale_video_impl)
 
 Phase 1: Initialization
 
@@ -113,7 +128,7 @@ Returns:
 
 
 
-**5. Status Tracking**
+## 5. Status Tracking
 Success Path
 
 Job JSON updated to:
@@ -134,7 +149,7 @@ Modal Timeout	>7200s job limit	Container killed, job failed
 
 
 
-**6. GPU Container Shutdown**
+## 6. GPU Container Shutdown
 
 Process exits (success or failure).
 
@@ -143,3 +158,19 @@ CUDA context destroyed, VRAM freed.
 /tmp directories cleaned up.
 
 Container destroyed, GPU becomes available for next job.
+
+## 🚀 7. Backup Logic (Fail-Safe Completion)
+
+When a job’s logs stop updating, a **fallback thread** ensures completion by checking if the output appears on BunnyCDN.
+
+| Step | Description |
+|:---- |:------------|
+| 🏁 Job start | Main upscaling begins + fallback starts in parallel |
+| ⏱ ETA wait | Waits for `estimate_eta_seconds()` duration |
+| 🔍 CDN check | Looks for `<video_name>_<res>.mp4` on BunnyCDN |
+| ✅ File found | Marks job as **completed** instantly |
+| 🔁 Missing file | Retries up to 3× (every 10 seconds) |
+| ❌ Timeout | Marks job as **failed** (`output file not found`) |
+| 🧠 Normal path | Regular completion overrides fallback |
+
+> 💡 **Why:** Prevents jobs from getting “stuck” if the main worker hangs.
