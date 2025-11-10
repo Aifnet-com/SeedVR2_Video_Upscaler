@@ -16,7 +16,6 @@ from typing import Optional
 
 app = modal.App("seedvr2-upscaler")
 progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
-jobs_dict = modal.Dict.from_name("seedvr2-jobs", create_if_missing=True)  # Job status storage
 
 # Bunny secret (created in Modal UI as "bunnycdn_storage")
 bunny_secret = modal.Secret.from_name("bunnycdn_storage")
@@ -544,16 +543,24 @@ def fastapi_app():
 
     web_app = FastAPI()
 
-    # Job storage using Modal Dict (strongly consistent, instant visibility)
+    # Local job cache (simple; okay since one web app handles status)
+    JOBS_DIR = "/outputs/jobs"
+    os.makedirs(JOBS_DIR, exist_ok=True)
+
     def save_job(job_id: str, job_data: dict):
         try:
-            jobs_dict[job_id] = job_data
+            with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
+                _json.dump(job_data, f)
         except Exception as e:
             print(f"⚠️ save_job error: {e}")
 
     def load_job(job_id: str):
         try:
-            return jobs_dict.get(job_id)
+            path = f"{JOBS_DIR}/{job_id}.json"
+            if not os.path.exists(path):
+                return None
+            with open(path, "r") as f:
+                return _json.load(f)
         except Exception as e:
             print(f"⚠️ load_job error: {e}")
             return None
@@ -956,12 +963,16 @@ def fastapi_app():
     async def root():
         # lightweight active count
         active = 0
-        try:
-            for job_id, job_data in jobs_dict.items():
-                if job_data.get("status") in ("pending", "processing"):
-                    active += 1
-        except Exception:
-            pass
+        if os.path.exists(JOBS_DIR):
+            for fn in os.listdir(JOBS_DIR):
+                if fn.endswith(".json"):
+                    try:
+                        with open(f"{JOBS_DIR}/{fn}", "r") as f:
+                            jd = _json.load(f)
+                        if jd.get("status") in ("pending", "processing"):
+                            active += 1
+                    except Exception:
+                        pass
 
         return {
             "service": "SeedVR2 Video Upscaler",
