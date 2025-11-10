@@ -825,8 +825,8 @@ def fastapi_app():
             "request": request.model_dump(),
         })
 
-        # Start fallback immediately (runs in parallel with main job)
-        asyncio.create_task(asyncio.to_thread(fallback_complete, job_id, request))
+        # Fallback now handled by auto-detection in /status endpoint
+        # (Removed asyncio fallback thread - wasn't working in Modal's environment)
 
         # run job in background
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
@@ -872,6 +872,41 @@ def fastapi_app():
                         created_at = job_data.get("created_at")
                         elapsed = (time.time() - created_at) if created_at else elapsed
         # === End Upload Watchdog ===
+
+        # === Auto-Completion Detection: Check if progress shows upload complete ===
+        if job_data.get("status") == "processing":
+            # Check both realtime progress and stored progress
+            check_progress = realtime or job_data.get("progress") or ""
+
+            if "Upload complete:" in check_progress:
+                # GPU completed upload but never returned - auto-promote!
+                try:
+                    cdn_url = check_progress.split("Upload complete:")[-1].strip()
+
+                    if cdn_url and cdn_url.startswith("http"):
+                        # Extract filename from URL
+                        filename = cdn_url.split("/")[-1] if "/" in cdn_url else "output.mp4"
+
+                        # Mark as completed
+                        job_data.update({
+                            "status": "completed",
+                            "download_url": cdn_url,
+                            "filename": filename,
+                            "progress": "✅ Completed (auto-detected from progress)"
+                        })
+                        save_job(job_id, job_data)
+
+                        # Clear progress_dict
+                        try:
+                            if job_id in progress_dict:
+                                del progress_dict[job_id]
+                        except Exception:
+                            pass
+
+                        print(f"✅ Auto-detected completion for {job_id} from progress")
+                except Exception as e:
+                    print(f"⚠️ Error auto-detecting completion: {e}")
+        # === End Auto-Completion Detection ===
 
         if realtime:
             job_data["progress"] = realtime
