@@ -16,6 +16,7 @@ from typing import Optional
 
 app = modal.App("seedvr2-upscaler")
 progress_dict = modal.Dict.from_name("seedvr2-progress", create_if_missing=True)
+jobs_dict = modal.Dict.from_name("seedvr2-jobs", create_if_missing=True)  # Job status storage
 
 # Bunny secret (created in Modal UI as "bunnycdn_storage")
 bunny_secret = modal.Secret.from_name("bunnycdn_storage")
@@ -543,24 +544,16 @@ def fastapi_app():
 
     web_app = FastAPI()
 
-    # Local job cache (simple; okay since one web app handles status)
-    JOBS_DIR = "/outputs/jobs"
-    os.makedirs(JOBS_DIR, exist_ok=True)
-
+    # Job storage using Modal Dict (strongly consistent, instant visibility)
     def save_job(job_id: str, job_data: dict):
         try:
-            with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
-                _json.dump(job_data, f)
+            jobs_dict[job_id] = job_data
         except Exception as e:
             print(f"⚠️ save_job error: {e}")
 
     def load_job(job_id: str):
         try:
-            path = f"{JOBS_DIR}/{job_id}.json"
-            if not os.path.exists(path):
-                return None
-            with open(path, "r") as f:
-                return _json.load(f)
+            return jobs_dict.get(job_id)
         except Exception as e:
             print(f"⚠️ load_job error: {e}")
             return None
@@ -845,32 +838,65 @@ def fastapi_app():
         try:
             if job_id in progress_dict:
                 pd = progress_dict[job_id]
-                realtime = pd.get("text") if isinstance(pd, dict) else pd
+                realtime = pd.get("text") if isinstance(pd, dict) else str(pd)
         except Exception:
             pass
 
         job_data = load_job(job_id)
+
+        # If we have no persisted job data yet:
         if not job_data:
             if realtime:
-                return JobStatus(job_id=job_id, status="processing", progress=realtime)
+                # Return a transient "processing" status based solely on live progress.
+                return JobStatus(
+                    job_id=job_id,
+                    status="processing",
+                    progress=realtime,
+                    download_url=None,
+                    filename=None,
+                    input_size_mb=None,
+                    output_size_mb=None,
+                    error=None,
+                    elapsed_seconds=None,
+                )
+            # Truly unknown job id
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # === Upload Watchdog: If stuck on "Uploading..." for >90s, check CDN ===
-        if job_data.get("status") in ("pending", "processing"):
-            progress_text = (realtime or job_data.get("progress") or "").lower()
-            created_at = job_data.get("created_at")
-            elapsed = (time.time() - created_at) if created_at else 0.0
+        # --- Upload Watchdog (only when we have a real job_data dict) ---
+        progress_text = (realtime or job_data.get("progress") or "")
+        created_at = job_data.get("created_at")
+        elapsed = (time.time() - created_at) if created_at else 0.0
 
-            if "uploading to bunny storage" in progress_text and elapsed > 90:
-                # Job might be stuck - try promoting from CDN
+        # If stuck on uploading for a while, try promote from CDN
+        if job_data.get("status") in ("pending", "processing"):
+            if "uploading to bunny storage" in progress_text.lower() and elapsed > 90:
                 request_payload = job_data.get("request", {})
                 if request_payload:
                     promoted = try_promote_from_cdn(job_id, request_payload)
                     if promoted:
-                        # Refresh job_data to return completed status
+                        # refresh the on-disk state to return the completed job
                         job_data = load_job(job_id) or job_data
                         created_at = job_data.get("created_at")
                         elapsed = (time.time() - created_at) if created_at else elapsed
+
+        # Keep the freshest progress text visible
+        if realtime:
+            job_data["progress"] = realtime
+
+        created_at = job_data.get("created_at")
+        elapsed = (time.time() - created_at) if created_at else None
+
+        return JobStatus(
+            job_id=job_id,
+            status=job_data.get("status", "pending"),
+            progress=job_data.get("progress"),
+            download_url=job_data.get("download_url"),
+            filename=job_data.get("filename"),
+            input_size_mb=job_data.get("input_size_mb"),
+            output_size_mb=job_data.get("output_size_mb"),
+            error=job_data.get("error"),
+            elapsed_seconds=elapsed,
+        )
         # === End Upload Watchdog ===
 
         # === Auto-Completion Detection: Check if progress shows upload complete ===
@@ -930,16 +956,12 @@ def fastapi_app():
     async def root():
         # lightweight active count
         active = 0
-        if os.path.exists(JOBS_DIR):
-            for fn in os.listdir(JOBS_DIR):
-                if fn.endswith(".json"):
-                    try:
-                        with open(f"{JOBS_DIR}/{fn}", "r") as f:
-                            jd = _json.load(f)
-                        if jd.get("status") in ("pending", "processing"):
-                            active += 1
-                    except Exception:
-                        pass
+        try:
+            for job_id, job_data in jobs_dict.items():
+                if job_data.get("status") in ("pending", "processing"):
+                    active += 1
+        except Exception:
+            pass
 
         return {
             "service": "SeedVR2 Video Upscaler",
