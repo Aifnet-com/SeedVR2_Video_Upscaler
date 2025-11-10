@@ -95,7 +95,7 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
     for attempt in range(3):
         try:
             with open(local_path, "rb") as f:
-                resp = requests.put(url, headers=headers, data=f, timeout=600)
+                resp = requests.put(url, headers=headers, data=f, timeout=60)
             if resp.status_code in (200, 201):
                 return f"{base_url}/{zone_rel_path}"
             else:
@@ -147,20 +147,23 @@ def probe_video_meta(url: str):
 
 
 def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
-    # Updated based on actual measurements from both 300 and 720 frame jobs
-    # 300 frames: ~435s actual, 720 frames: ~924s actual
-    per100_gpu = {"720p": 58, "1080p": 61, "2k": 120, "4k": 250}  # Lowered: longer jobs are more efficient per batch
+    # Based on actual measurements: 300 frames = 435s, 720 frames = 924s
+    per100_gpu = {"720p": 58, "1080p": 61, "2k": 120, "4k": 250}  # Measured: longer jobs more efficient
     base_gpu = per100_gpu.get(resolution, 61)
     num_batches = max(1, int((frames + batch_size - 1) / batch_size))
 
     gpu_time = base_gpu * (frames / 100.0)
-    model_reload_time = 45 + (12 * max(0, num_batches - 1))
+    model_reload_time = 45 + (12 * max(0, num_batches - 1))  # Measured: 12s per reload
     stitch_time = 2 * max(0, num_batches - 1)
-    save_encode_time = (7.6 * (frames / 100.0)) + 10  # CRITICAL FIX: Was 3.5, now 7.6!
-    upload_time = max(5, int(frames / 100.0 * 3))  # Increased: larger files take longer
+
+    # CRITICAL: Save time scales NON-LINEARLY with frames!
+    # 300 frames: ~15s = 5.0s per 100 frames
+    # 720 frames: ~55s = 7.6s per 100 frames
+    save_encode_time = (7.6 * (frames / 100.0)) + 10  # Must use frames, not batches!
+    upload_time = max(5, int(frames / 100.0 * 3))
 
     total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
-    return int(total * 1.40)  # Increased margin: 35%→40% for safety
+    return int(total * 1.40)  # 40% margin for safety
 
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
@@ -659,14 +662,14 @@ def fastapi_app():
 
         print(f"🔄 Fallback started for {job_id}, ETA {eta}s ({eta/60:.1f}min)")
 
-        # Start checking at 65% of ETA (earlier for longer jobs)
-        initial_wait = int(eta * 0.65)
+        # Start checking at 60% of ETA to handle early completions and variance
+        initial_wait = int(eta * 0.60)
         _t.sleep(initial_wait)
 
-        # Check 22 times at 20s intervals = 440s window (~7.3 min)
-        # This provides robust coverage for variance in longer jobs
-        num_checks = 22
-        check_interval = 20
+        # Check 20 times at 25s intervals = 500s window
+        # This provides robust coverage for timing variance
+        num_checks = 20
+        check_interval = 25
 
         for attempt in range(num_checks):
             # Check 1: progress_dict for success marker
@@ -773,6 +776,12 @@ def fastapi_app():
 
             # Persist results (normal completion)
             job_data = load_job(job_id) or {}
+
+            # CRITICAL: Don't overwrite if fallback already completed this job!
+            if job_data.get("status") == "completed" and "fallback" in job_data.get("progress", ""):
+                print(f"⚠️ Job {job_id} already completed by fallback, skipping main thread update")
+                return
+
             job_data.update({
                 "status": "completed",
                 "download_url": res["cdn_url"],   # direct CDN file
