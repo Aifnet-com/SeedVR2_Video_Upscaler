@@ -1,11 +1,16 @@
-"""
-SeedVR2 Upscaler (Modal + FastAPI)
-- H100 for 720p/1080p, H200 for 2K/4K
-- Real-time progress via Modal Dict
-- Watchdog to kill stalled runs
-- FINAL ARTIFACT: uploaded directly to Bunny Storage via HTTPS PUT
-- Status returns a DIRECT CDN URL (no Modal volume commits)
-"""
+# SeedVR2 Upscaler (Modal + FastAPI)
+# - H100 for 720p/1080p, H200 for 2K/4K
+# - Real-time progress via Modal Dict
+# - Watchdog to kill stalled runs
+# - FINAL ARTIFACT: uploaded directly to Bunny Storage via HTTPS PUT
+# - Status returns a DIRECT CDN URL (no Modal volume commits)
+#
+# Enhancements in this version:
+# - Pending/Processing stall detection & timeouts in /status
+# - Track last progress update timestamps
+# - Admin cleanup endpoint /cleanup
+# - Stronger watchdogs
+# - 30m GPU function timeouts
 
 import os
 import json
@@ -120,6 +125,7 @@ def derive_output_paths(video_url: str, resolution: str):
     cdn_url = f"{base_url}/{zone_rel_path}"
     return filename, zone_rel_path, cdn_url
 
+
 def probe_video_meta(url: str):
     """Use ffprobe on the remote input URL to estimate duration/fps/frames (no full download)."""
     import subprocess, json as _json
@@ -165,6 +171,7 @@ def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
     total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
     return int(total * 1.40)  # 40% margin for safety
 
+
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
     import requests
@@ -180,26 +187,15 @@ def cdn_file_exists(cdn_url: str):
 # ---------------- Utility: progress + timeout heuristics ----------------
 
 def _update_job_progress(job_id: str, progress_text: str):
-    """Update progress in shared dict (fast path)."""
+    """Update progress in shared dict (fast path) and persist last_update timestamp."""
     if not job_id:
         return
     import time
     try:
-        progress_dict[job_id] = {"text": progress_text, "timestamp": time.time()}
+        now = time.time()
+        progress_dict[job_id] = {"text": progress_text, "timestamp": now}
     except Exception as e:
         print(f"⚠️ progress_dict update failed: {e}")
-
-def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
-    """
-    Timeout must exceed per-batch processing time (we only log between batches).
-    Empirical seconds per 100 frames:
-      720p ~50, 1080p ~70, 2k ~120, 4k ~250.
-    """
-    time_per_100_frames = {"720p": 50, "1080p": 70, "2k": 120, "4k": 250}
-    base = time_per_100_frames.get(resolution, 62)
-    expected_batch = int(base * (batch_size / 100))
-    first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)  # add model load + slack
-    return first_batch_timeout
 
 # ---------------- Core upscaler implementation ----------------
 
@@ -273,9 +269,6 @@ def _upscale_video_impl(
         if w == 0 or h == 0:
             raise Exception(f"Could not read input dimensions ({w}x{h})")
 
-        # Timeouts
-        stall_timeout = _calculate_stall_timeout(resolution, batch_size)
-
         # Target dims by pixel budget (rounded to /16)
         target_pixels_map = {"720p": 921600, "1080p": 2073600, "2k": 3686400, "4k": 8294400}
         tgt = target_pixels_map.get(resolution, 2073600)
@@ -300,7 +293,7 @@ def _upscale_video_impl(
 
         _update_job_progress(job_id, "🔧 Starting upscale process...")
 
-        # Run with streaming + watchdog
+        # Run with streaming + watchdogs
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -315,9 +308,20 @@ def _upscale_video_impl(
         last_heartbeat = time_module.time()
         stalled_kill = False
         is_first_batch = True
+        global_timeout_seconds = 1800  # hard kill after 30 minutes
+        start_ts = time_module.time()
 
-        def watchdog():
+        def stall_watchdog():
             nonlocal stalled_kill, last_heartbeat, is_first_batch
+            # per-batch stall watchdog (existing behavior)
+            # compute stall timeout based on resolution and batch size
+            def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
+                time_per_100_frames = {"720p": 50, "1080p": 70, "2k": 120, "4k": 250}
+                base = time_per_100_frames.get(resolution, 62)
+                expected_batch = int(base * (batch_size / 100))
+                first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)
+                return first_batch_timeout
+            stall_timeout = _calculate_stall_timeout(resolution, batch_size)
             while proc.poll() is None:
                 time_module.sleep(10)
                 if time_module.time() - last_heartbeat > stall_timeout:
@@ -332,8 +336,21 @@ def _upscale_video_impl(
                         print(f"⚠️ watchdog kill error: {e}")
                     break
 
+        def global_watchdog():
+            # absolute max runtime watchdog (strong kill)
+            while proc.poll() is None:
+                time_module.sleep(10)
+                if time_module.time() - start_ts > global_timeout_seconds:
+                    print("❌ Watchdog: global timeout reached, killing job")
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    break
+
         import threading as _t
-        _t.Thread(target=watchdog, daemon=True).start()
+        _t.Thread(target=stall_watchdog, daemon=True).start()
+        _t.Thread(target=global_watchdog, daemon=True).start()
 
         for line in iter(proc.stdout.readline, ''):
             if not line:
@@ -366,7 +383,7 @@ def _upscale_video_impl(
 
         proc.wait()
         if stalled_kill:
-            raise Exception(f"Job stalled (>{stall_timeout}s) and was killed")
+            raise Exception(f"Job stalled and was killed by watchdog")
         if proc.returncode != 0:
             tail = "\n".join(lines[-20:])
             raise Exception(f"Upscaling failed:\n{tail}")
@@ -480,7 +497,7 @@ def _upscale_video_impl(
 @app.function(
     image=image,
     gpu="H100",
-    timeout=7200,
+    timeout=1800,  # 30 minute hard timeout
     secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
@@ -504,7 +521,7 @@ def upscale_video_h100(
 @app.function(
     image=image,
     gpu="H200",
-    timeout=7200,
+    timeout=1800,  # 30 minute hard timeout
     secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
@@ -643,111 +660,11 @@ def fastapi_app():
 
         return False
 
-    def fallback_complete(job_id: str, request: UpscaleRequest):
-        """
-        Fallback thread: Waits for ETA, then checks CDN periodically.
-        Promotes job to completed if file appears, even if main thread hangs.
-        """
-        import time as _t
-
-        # Determine expected CDN URL
-        expected_filename, _expected_zone_rel, expected_cdn_url = derive_output_paths(
-            request.video_url or "", request.resolution
-        )
-
-        # Calculate ETA
-        meta = probe_video_meta(request.video_url) if request.video_url else None
-        frames = (meta or {}).get("frames", 300)
-        eta = max(estimate_eta_seconds(frames, request.resolution), 90)
-
-        print(f"🔄 Fallback started for {job_id}, ETA {eta}s ({eta/60:.1f}min)")
-
-        # Start checking at 60% of ETA to handle early completions and variance
-        initial_wait = int(eta * 0.60)
-        _t.sleep(initial_wait)
-
-        # Check 20 times at 25s intervals = 500s window
-        # This provides robust coverage for timing variance
-        num_checks = 20
-        check_interval = 25
-
-        for attempt in range(num_checks):
-            # Check 1: progress_dict for success marker
-            try:
-                progress_data = progress_dict.get(job_id, {})
-                progress_text = progress_data.get("text", "") if isinstance(progress_data, dict) else str(progress_data)
-
-                if "Upload complete:" in progress_text:
-                    # Extract CDN URL from progress
-                    cdn_url_from_progress = progress_text.split("Upload complete:")[-1].strip()
-
-                    job_data = load_job(job_id) or {}
-                    if job_data.get("status") != "completed":
-                        job_data.update({
-                            "status": "completed",
-                            "progress": "✅ Completed via fallback (progress detection)",
-                            "download_url": cdn_url_from_progress,
-                            "filename": expected_filename,
-                        })
-                        save_job(job_id, job_data)
-                        print(f"✅ Fallback: Detected success in progress_dict for {job_id}")
-
-                        try:
-                            if job_id in progress_dict:
-                                del progress_dict[job_id]
-                        except Exception:
-                            pass
-                    return
-            except Exception as e:
-                print(f"⚠️ Fallback progress check error: {e}")
-
-            # Check 2: CDN file existence
-            ok, size = cdn_file_exists(expected_cdn_url)
-            if ok:
-                job_data = load_job(job_id) or {}
-                if job_data.get("status") != "completed":
-                    job_data.update({
-                        "status": "completed",
-                        "progress": "✅ Completed via fallback (CDN detection)",
-                        "download_url": expected_cdn_url,
-                        "filename": expected_filename,
-                        "output_size_mb": size / (1024 * 1024) if size else None,
-                    })
-                    save_job(job_id, job_data)
-                    print(f"✅ Fallback: Found CDN file for {job_id}")
-
-                    try:
-                        if job_id in progress_dict:
-                            del progress_dict[job_id]
-                    except Exception:
-                        pass
-                return
-
-            if attempt < num_checks - 1:
-                elapsed = initial_wait + (attempt * check_interval)
-                print(f"⚠️ Fallback check {attempt+1}/{num_checks}: not found (elapsed {elapsed}s)")
-                _t.sleep(check_interval)
-
-        # After all retries: mark as failed
-        job_data = load_job(job_id) or {}
-        if job_data.get("status") not in ("completed", "failed"):
-            job_data.update({
-                "status": "failed",
-                "error": "❌ Fallback timeout: output file not found on BunnyCDN",
-                "progress": "❌ Job failed: output file missing",
-            })
-            save_job(job_id, job_data)
-            try:
-                if job_id in progress_dict:
-                    del progress_dict[job_id]
-            except Exception:
-                pass
-            print(f"❌ Fallback: job {job_id} failed - file never appeared")
-
     def process_video(job_id: str, request: UpscaleRequest):
         try:
             job_data = load_job(job_id) or {}
-            job_data.update({"status": "processing", "progress": "Starting upscaler..."})
+            now = time.time()
+            job_data.update({"status": "processing", "progress": "Starting upscaler...", "last_progress_update": now})
             save_job(job_id, job_data)
 
             # Choose GPU
@@ -817,16 +734,15 @@ def fastapi_app():
         job_id = str(uuid.uuid4())
         gpu_type = "H100" if request.resolution in ["720p", "1080p"] else "H200"
 
+        now = time.time()
         save_job(job_id, {
             "job_id": job_id,
             "status": "pending",
-            "created_at": time.time(),
+            "created_at": now,
+            "last_progress_update": now,
             "gpu_type": gpu_type,
             "request": request.model_dump(),
         })
-
-        # Fallback now handled by auto-detection in /status endpoint
-        # (Removed asyncio fallback thread - wasn't working in Modal's environment)
 
         # run job in background
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
@@ -842,10 +758,15 @@ def fastapi_app():
     async def get_job_status(job_id: str):
         # real-time progress from shared dict
         realtime = None
+        realtime_ts = None
         try:
             if job_id in progress_dict:
                 pd = progress_dict[job_id]
-                realtime = pd.get("text") if isinstance(pd, dict) else str(pd)
+                if isinstance(pd, dict):
+                    realtime = pd.get("text")
+                    realtime_ts = pd.get("timestamp")
+                else:
+                    realtime = str(pd)
         except Exception:
             pass
 
@@ -867,11 +788,21 @@ def fastapi_app():
                     elapsed_seconds=None,
                 )
             # Truly unknown job id
-            raise HTTPException(status_code=404, detail="Job not found")
+            from fastapi import HTTPException as _HTTP
+            raise _HTTP(status_code=404, detail="Job not found")
+
+        # --- Merge freshest progress & timestamp ---
+        if realtime:
+            job_data["progress"] = realtime
+            if realtime_ts:
+                job_data["last_progress_update"] = realtime_ts
+            else:
+                job_data["last_progress_update"] = time.time()
+            save_job(job_id, job_data)
 
         # --- Upload Watchdog (only when we have a real job_data dict) ---
         progress_text = (realtime or job_data.get("progress") or "")
-        created_at = job_data.get("created_at")
+        created_at = job_data.get("created_at", 0)
         elapsed = (time.time() - created_at) if created_at else 0.0
 
         # If stuck on uploading for a while, try promote from CDN
@@ -883,24 +814,17 @@ def fastapi_app():
                     if promoted:
                         # refresh the on-disk state to return the completed job
                         job_data = load_job(job_id) or job_data
-                        created_at = job_data.get("created_at")
+                        created_at = job_data.get("created_at", created_at)
                         elapsed = (time.time() - created_at) if created_at else elapsed
 
         # === Auto-Completion Detection: Check if progress shows upload complete ===
         if job_data.get("status") == "processing":
-            # Check both realtime progress and stored progress
             check_progress = realtime or job_data.get("progress") or ""
-
             if "Upload complete:" in check_progress:
-                # GPU completed upload but never returned - auto-promote!
                 try:
                     cdn_url = check_progress.split("Upload complete:")[-1].strip()
-
                     if cdn_url and cdn_url.startswith("http"):
-                        # Extract filename from URL
                         filename = cdn_url.split("/")[-1] if "/" in cdn_url else "output.mp4"
-
-                        # Mark as completed
                         job_data.update({
                             "status": "completed",
                             "download_url": cdn_url,
@@ -908,27 +832,55 @@ def fastapi_app():
                             "progress": "✅ Completed (auto-detected from progress)"
                         })
                         save_job(job_id, job_data)
-
-                        # Clear progress_dict
                         try:
                             if job_id in progress_dict:
                                 del progress_dict[job_id]
                         except Exception:
                             pass
-
                         print(f"✅ Auto-detected completion for {job_id} from progress")
                 except Exception as e:
                     print(f"⚠️ Error auto-detecting completion: {e}")
         # === End Auto-Completion Detection ===
 
-        # Keep the freshest progress text visible
-        if realtime:
-            job_data["progress"] = realtime
+        # === Stalled Job Detection ===
+        status_now = job_data.get("status")
+        last_progress_update = job_data.get("last_progress_update", created_at)
+        time_since_last_update = time.time() - last_progress_update if last_progress_update else elapsed
+        max_processing_time = 1800  # 30 minutes
 
-        created_at = job_data.get("created_at")
+        # Jobs stuck in pending (never scheduled) — 2 min timeout
+        if status_now == "pending" and elapsed > 120:
+            job_data.update({
+                "status": "failed",
+                "error": "Job failed to start - Modal scheduling timeout",
+                "progress": "❌ Failed to start",
+            })
+            save_job(job_id, job_data)
+
+        # Jobs stuck in processing (no updates)
+        elif status_now == "processing":
+            if elapsed > max_processing_time:
+                job_data.update({
+                    "status": "failed",
+                    "error": f"Job timed out after {int(elapsed/60)} minutes",
+                    "progress": f"❌ Timed out after {int(elapsed/60)} minutes",
+                })
+                save_job(job_id, job_data)
+                try:
+                    if job_id in progress_dict:
+                        del progress_dict[job_id]
+                except Exception:
+                    pass
+            elif time_since_last_update > 300 and not realtime:  # 5 minutes w/o updates
+                if "⚠️" not in (job_data.get("progress") or ""):
+                    job_data["progress"] = f"⚠️ No updates for {int(time_since_last_update/60)} min - may be stalled"
+                    save_job(job_id, job_data)
+        # === End Stalled Job Detection ===
+
+        # Recompute elapsed for return
+        created_at = job_data.get("created_at", created_at)
         elapsed = (time.time() - created_at) if created_at else None
 
-        # Single return statement at the end
         return JobStatus(
             job_id=job_id,
             status=job_data.get("status", "pending"),
@@ -940,7 +892,28 @@ def fastapi_app():
             error=job_data.get("error"),
             elapsed_seconds=elapsed,
         )
-    
+
+    @web_app.post("/cleanup")
+    async def cleanup_stalled_jobs():
+        """Admin endpoint to clean up stalled jobs older than 1 hour."""
+        cleaned = []
+        if os.path.exists(JOBS_DIR):
+            for fn in os.listdir(JOBS_DIR):
+                if fn.endswith(".json"):
+                    job_id = fn[:-5]
+                    job_data = load_job(job_id)
+                    if job_data and job_data.get("status") in ("pending", "processing"):
+                        created_at = job_data.get("created_at", 0)
+                        elapsed = time.time() - created_at
+                        if elapsed > 3600:  # 1 hour
+                            job_data.update({
+                                "status": "failed",
+                                "error": f"Job stalled and cleaned up after {int(elapsed/60)} minutes",
+                            })
+                            save_job(job_id, job_data)
+                            cleaned.append(job_id)
+        return {"cleaned": len(cleaned), "job_ids": cleaned}
+
     @web_app.get("/")
     async def root():
         # lightweight active count
@@ -958,10 +931,11 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "4.2 - Bunny Storage (direct URL) + CDN fallback",
+            "version": "4.3 - Stall handling + cleanup + 30m watchdogs",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
+                "cleanup": "POST /cleanup",
             },
             "active_jobs": active,
         }
