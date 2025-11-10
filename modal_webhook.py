@@ -886,26 +886,6 @@ def fastapi_app():
                         created_at = job_data.get("created_at")
                         elapsed = (time.time() - created_at) if created_at else elapsed
 
-        # Keep the freshest progress text visible
-        if realtime:
-            job_data["progress"] = realtime
-
-        created_at = job_data.get("created_at")
-        elapsed = (time.time() - created_at) if created_at else None
-
-        return JobStatus(
-            job_id=job_id,
-            status=job_data.get("status", "pending"),
-            progress=job_data.get("progress"),
-            download_url=job_data.get("download_url"),
-            filename=job_data.get("filename"),
-            input_size_mb=job_data.get("input_size_mb"),
-            output_size_mb=job_data.get("output_size_mb"),
-            error=job_data.get("error"),
-            elapsed_seconds=elapsed,
-        )
-        # === End Upload Watchdog ===
-
         # === Auto-Completion Detection: Check if progress shows upload complete ===
         if job_data.get("status") == "processing":
             # Check both realtime progress and stored progress
@@ -941,24 +921,26 @@ def fastapi_app():
                     print(f"⚠️ Error auto-detecting completion: {e}")
         # === End Auto-Completion Detection ===
 
+        # Keep the freshest progress text visible
         if realtime:
             job_data["progress"] = realtime
 
         created_at = job_data.get("created_at")
         elapsed = (time.time() - created_at) if created_at else None
 
+        # Single return statement at the end
         return JobStatus(
             job_id=job_id,
             status=job_data.get("status", "pending"),
             progress=job_data.get("progress"),
-            download_url=job_data.get("download_url"),  # direct CDN file
+            download_url=job_data.get("download_url"),
             filename=job_data.get("filename"),
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
             error=job_data.get("error"),
             elapsed_seconds=elapsed,
         )
-
+    
     @web_app.get("/")
     async def root():
         # lightweight active count
