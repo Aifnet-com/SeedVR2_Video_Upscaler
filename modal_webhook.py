@@ -825,8 +825,8 @@ def fastapi_app():
             "request": request.model_dump(),
         })
 
-        # Fallback now handled by auto-detection in /status endpoint
-        # (Removed asyncio fallback thread - wasn't working in Modal's environment)
+        # Start fallback immediately (runs in parallel with main job)
+        asyncio.create_task(asyncio.to_thread(fallback_complete, job_id, request))
 
         # run job in background
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
@@ -845,67 +845,36 @@ def fastapi_app():
         try:
             if job_id in progress_dict:
                 pd = progress_dict[job_id]
-                realtime = pd.get("text") if isinstance(pd, dict) else str(pd)
+                realtime = pd.get("text") if isinstance(pd, dict) else pd
         except Exception:
             pass
 
         job_data = load_job(job_id)
-
-        # If we have no persisted job data yet:
-
         if not job_data:
             if realtime:
-                return JobStatus(
-                    job_id=job_id, status="processing", progress=realtime,
-                    download_url=None, filename=None, input_size_mb=None,
-                    output_size_mb=None, error=None, elapsed_seconds=None,
-                )
+                return JobStatus(job_id=job_id, status="processing", progress=realtime)
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # --- Upload Watchdog (only when we have a real job_data dict) ---
-        progress_text = (realtime or job_data.get("progress") or "")
-        created_at = job_data.get("created_at")
-        elapsed = (time.time() - created_at) if created_at else 0.0
-
-        # If stuck on uploading for a while, try promote from CDN
+        # === Upload Watchdog: If stuck on "Uploading..." for >90s, check CDN ===
         if job_data.get("status") in ("pending", "processing"):
-            if "uploading to bunny storage" in progress_text.lower() and elapsed > 90:
+            progress_text = (realtime or job_data.get("progress") or "").lower()
+            created_at = job_data.get("created_at")
+            elapsed = (time.time() - created_at) if created_at else 0.0
+
+            if "uploading to bunny storage" in progress_text and elapsed > 90:
+                # Job might be stuck - try promoting from CDN
                 request_payload = job_data.get("request", {})
                 if request_payload:
                     promoted = try_promote_from_cdn(job_id, request_payload)
                     if promoted:
-                        # refresh the on-disk state to return the completed job
+                        # Refresh job_data to return completed status
                         job_data = load_job(job_id) or job_data
                         created_at = job_data.get("created_at")
                         elapsed = (time.time() - created_at) if created_at else elapsed
+        # === End Upload Watchdog ===
 
-        # Keep the freshest progress text visible
         if realtime:
             job_data["progress"] = realtime
-
-        # --- Auto-Completion Detection (MOVE THIS ABOVE THE RETURN) ---
-        if job_data.get("status") == "processing":
-            check_progress = job_data.get("progress") or ""
-            if "Upload complete:" in check_progress:
-                try:
-                    cdn_url = check_progress.split("Upload complete:")[-1].strip()
-                    if cdn_url.startswith("http"):
-                        filename = cdn_url.rsplit("/", 1)[-1]
-                        job_data.update({
-                            "status": "completed",
-                            "download_url": cdn_url,
-                            "filename": filename,
-                            "progress": "✅ Completed (auto-detected from progress)"
-                        })
-                        save_job(job_id, job_data)
-                        try:
-                            if job_id in progress_dict:
-                                del progress_dict[job_id]
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"⚠️ Error auto-detecting completion: {e}")
-        # --- end auto-completion ---
 
         created_at = job_data.get("created_at")
         elapsed = (time.time() - created_at) if created_at else None
@@ -914,7 +883,7 @@ def fastapi_app():
             job_id=job_id,
             status=job_data.get("status", "pending"),
             progress=job_data.get("progress"),
-            download_url=job_data.get("download_url"),
+            download_url=job_data.get("download_url"),  # direct CDN file
             filename=job_data.get("filename"),
             input_size_mb=job_data.get("input_size_mb"),
             output_size_mb=job_data.get("output_size_mb"),
