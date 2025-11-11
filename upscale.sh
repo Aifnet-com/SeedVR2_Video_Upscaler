@@ -58,65 +58,42 @@ fi
 
 echo ""
 
-# Track registration waiting time
-REGISTRATION_START=$(date +%s)
-REGISTRATION_TIMEOUT=60  # 1 minute to wait for registration
-STORAGE_CHECK_ATTEMPTS=0
-MAX_STORAGE_CHECKS=10
-LAST_MESSAGE=""
-
 # Poll status
+REGISTRATION_START=$(date +%s)
+REGISTRATION_CHECKS=0
+
 while true; do
     STATUS=$(curl -s "$API_URL/status/$JOB_ID")
     STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
 
-    # Handle initial sync delay (404s) with timeout
+    # Handle initial sync delay (404s)
     if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
-        CURRENT_TIME=$(date +%s)
-        ELAPSED_REGISTRATION=$((CURRENT_TIME - REGISTRATION_START))
+        NOW=$(date +%s)
+        WAIT_TIME=$((NOW - REGISTRATION_START))
 
-        if [ $ELAPSED_REGISTRATION -ge $REGISTRATION_TIMEOUT ]; then
-            # After 1 minute of waiting, start checking storage
-            if [ $STORAGE_CHECK_ATTEMPTS -eq 0 ]; then
-                echo ""
-                echo "⚠️  Job not registered after 60 seconds. Checking storage for output..."
-            fi
-
-            # Check storage every 30 seconds for up to 10 times
-            if [ $STORAGE_CHECK_ATTEMPTS -lt $MAX_STORAGE_CHECKS ]; then
-                STORAGE_CHECK_ATTEMPTS=$((STORAGE_CHECK_ATTEMPTS + 1))
-                printf "\r\033[K🔍 Checking storage... (attempt $STORAGE_CHECK_ATTEMPTS/$MAX_STORAGE_CHECKS)"
-
-                # Wait 30 seconds between storage checks (except for the first one)
-                if [ $STORAGE_CHECK_ATTEMPTS -gt 1 ]; then
-                    sleep 30
-                fi
-
-                # Try to get status again after waiting
-                STATUS=$(curl -s "$API_URL/status/$JOB_ID")
-                STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
-
-                # If still no status, continue checking
-                if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
-                    continue
-                fi
+        # If waiting more than 60 seconds, start checking storage
+        if [ $WAIT_TIME -ge 60 ]; then
+            if [ $REGISTRATION_CHECKS -lt 10 ]; then
+                printf "\r\033[K⏳ Job not registered after ${WAIT_TIME}s. Checking storage (attempt $((REGISTRATION_CHECKS + 1))/10)..."
+                REGISTRATION_CHECKS=$((REGISTRATION_CHECKS + 1))
+                sleep 30
+                continue
             else
-                # Failed after all storage checks
+                # Failed after 10 checks (60s + 10*30s = 360s total)
                 printf "\r\033[K"
                 echo ""
-                echo "❌ Job failed: Could not find output after $MAX_STORAGE_CHECKS storage checks"
-                echo "   Job may have failed to start or output was not uploaded"
+                echo "❌ Job failed to register after 6 minutes"
+                echo "Job ID: $JOB_ID"
+                echo "This likely indicates a Modal scheduling failure."
                 exit 1
             fi
         else
-            # Still within the 1-minute registration window
-            printf "\r\033[K⏳ Waiting for job to be registered... ($ELAPSED_REGISTRATION seconds)"
+            printf "\r\033[K⏳ Waiting for job to be registered... (${WAIT_TIME}s)"
             sleep 2
             continue
         fi
     fi
 
-    # If we got here, we have a valid status
     ELAPSED=$(echo $STATUS | jq -r '.elapsed_seconds')
     PROGRESS=$(echo $STATUS | jq -r '.progress')
 
@@ -136,28 +113,12 @@ while true; do
         printf "\r\033[K"
         ERROR=$(echo $STATUS | jq -r '.error')
         echo "❌ Job failed: $ERROR"
-
-        # Check if it's a pending timeout failure
-        if [[ "$ERROR" == *"Modal scheduling timeout"* ]]; then
-            echo "   The job could not be scheduled on Modal. Please try again later."
-        fi
         exit 1
 
     else
-        # Show progress
-        if [ -n "$ELAPSED" ] && [ "$ELAPSED" != "null" ]; then
-            MINS=$(echo "$ELAPSED" | awk '{print int($1/60)}')
-            SECS=$(echo "$ELAPSED" | awk '{print int($1%60)}')
-            CURRENT_MESSAGE="⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
-        else
-            CURRENT_MESSAGE="⏳ Status: $STATE [$PROGRESS]"
-        fi
-
-        # Only update if message changed to reduce flickering
-        if [ "$CURRENT_MESSAGE" != "$LAST_MESSAGE" ]; then
-            printf "\r\033[K$CURRENT_MESSAGE"
-            LAST_MESSAGE="$CURRENT_MESSAGE"
-        fi
+        MINS=$((${ELAPSED%.*} / 60))
+        SECS=$((${ELAPSED%.*} % 60))
+        printf "\r\033[K⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
     fi
 
     sleep 5

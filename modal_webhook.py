@@ -99,456 +99,700 @@ def upload_to_bunny_storage(local_path: str, zone_rel_path: str) -> str:
             if resp.status_code in (200, 201):
                 return f"{base_url}/{zone_rel_path}"
             else:
-                print(f"❌ Upload failed (attempt {attempt+1}/3): {resp.status_code}")
-                _t.sleep(2)
+                print(f"⚠️ Bunny upload failed [{resp.status_code}]: {resp.text[:300]}")
         except Exception as e:
-            print(f"❌ Upload error: {e}")
-            _t.sleep(2)
-    raise RuntimeError(f"Failed to upload after 3 attempts")
+            print(f"⚠️ Bunny upload error (attempt {attempt+1}/3): {e}")
+        _t.sleep(3 * (attempt + 1))
 
+    raise Exception("Bunny upload failed after 3 attempts")
 
-def check_bunny_file_exists(zone_rel_path: str) -> bool:
-    """
-    Check if a file exists in Bunny Storage via HEAD request.
-    Returns True if file exists, False otherwise.
-    """
-    import requests
+# ---------------- Fallback helpers (CDN probing) ----------------
 
-    host, zone, accesskey, base_url, _root = _bunny_cfg()
+def derive_output_paths(video_url: str, resolution: str):
+    """Return (filename, zone_rel_path, cdn_url) based on input URL + resolution."""
+    import os, urllib.parse
+    _, _, _, base_url, root_dir = _bunny_cfg()
+    parsed = urllib.parse.urlparse(video_url or "")
+    base = os.path.basename(parsed.path) or "video.mp4"
+    name_root, _ = os.path.splitext(base)
+    filename = f"{name_root}_{resolution}.mp4"
+    zone_rel_path = f"{root_dir}/{filename}"
+    cdn_url = f"{base_url}/{zone_rel_path}"
+    return filename, zone_rel_path, cdn_url
 
-    zone_rel_path = zone_rel_path.lstrip("/")
-    url = f"https://{host}/{zone}/{zone_rel_path}"
-
-    headers = {
-        "AccessKey": accesskey,
-    }
-
+def probe_video_meta(url: str):
+    """Use ffprobe on the remote input URL to estimate duration/fps/frames (no full download)."""
+    import subprocess, json as _json
     try:
-        resp = requests.head(url, headers=headers, timeout=10)
-        return resp.status_code == 200
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate:format=duration",
+                "-of", "json",
+                url,
+            ],
+            text=True,
+            timeout=20,
+        )
+        data = _json.loads(out)
+        dur = float(data["format"]["duration"])
+        fr = data["streams"][0]["avg_frame_rate"]  # e.g., "25/1"
+        n, d = fr.split("/")
+        fps = float(n) / float(d or 1)
+        frames = max(1, int(round(dur * fps)))
+        return {"duration": dur, "fps": fps, "frames": frames}
+    except Exception:
+        return None
+
+
+def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
+    # Based on actual measurements: 300 frames = 435s, 720 frames = 924s
+    per100_gpu = {"720p": 58, "1080p": 61, "2k": 120, "4k": 250}  # Measured: longer jobs more efficient
+    base_gpu = per100_gpu.get(resolution, 61)
+    num_batches = max(1, int((frames + batch_size - 1) / batch_size))
+
+    gpu_time = base_gpu * (frames / 100.0)
+    model_reload_time = 45 + (12 * max(0, num_batches - 1))  # Measured: 12s per reload
+    stitch_time = 2 * max(0, num_batches - 1)
+
+    # CRITICAL: Save time scales NON-LINEARLY with frames!
+    # 300 frames: ~15s = 5.0s per 100 frames
+    # 720 frames: ~55s = 7.6s per 100 frames
+    save_encode_time = (7.6 * (frames / 100.0)) + 10  # Must use frames, not batches!
+    upload_time = max(5, int(frames / 100.0 * 3))
+
+    total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
+    return int(total * 1.40)  # 40% margin for safety
+
+def cdn_file_exists(cdn_url: str):
+    """HEAD the CDN URL; return (exists, size_bytes)."""
+    import requests
+    try:
+        r = requests.head(cdn_url, timeout=10)
+        if r.status_code == 200:
+            size = int(r.headers.get("Content-Length", "0") or 0)
+            return True, size
+    except Exception:
+        pass
+    return False, 0
+
+# ---------------- Utility: progress + timeout heuristics ----------------
+
+def _update_job_progress(job_id: str, progress_text: str):
+    """Update progress in shared dict (fast path)."""
+    if not job_id:
+        return
+    import time
+    try:
+        progress_dict[job_id] = {"text": progress_text, "timestamp": time.time()}
     except Exception as e:
-        print(f"⚠️ Error checking file existence: {e}")
-        return False
+        print(f"⚠️ progress_dict update failed: {e}")
 
+def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
+    """
+    Timeout must exceed per-batch processing time (we only log between batches).
+    Empirical seconds per 100 frames:
+      720p ~50, 1080p ~70, 2k ~120, 4k ~250.
+    """
+    time_per_100_frames = {"720p": 50, "1080p": 70, "2k": 120, "4k": 250}
+    base = time_per_100_frames.get(resolution, 62)
+    expected_batch = int(base * (batch_size / 100))
+    first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)  # add model load + slack
+    return first_batch_timeout
 
-# ---------------- GPU Processing Function (Single) ----------------
+# ---------------- Core upscaler implementation ----------------
 
-@app.function(
-    image=image,
-    volumes={
-        "/models": model_volume,
-        "/outputs": output_volume,
-    },
-    secrets=[bunny_secret],
-    cpu=2,
-    timeout=1800,  # 30 minutes
-)
-def process_upscale(
-    job_id: str,
-    video_url: str,
+def _upscale_video_impl(
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    batch_size: int = 100,
+    temporal_overlap: int = 12,
+    stitch_mode: str = "crossfade",
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
     resolution: str = "1080p",
-    video_base64: Optional[str] = None
+    gpu_type: str = "H100",
+    job_id: Optional[str] = None,
 ):
     """
-    Main upscaling function that runs inside the GPU container.
-    Dynamically selects H100 for 720p/1080p, or H200 for 2K/4K.
+    Run SeedVR2, then upload the resulting MP4 to Bunny Storage.
+    Returns filename, sizes, and the direct CDN URL (cdn_url).
     """
-    import torch
-    import subprocess
-    import os
-    import sys
-    import time
-    import tempfile
-    import shutil
-    import cv2
-    import base64
-    import requests
+    import subprocess, tempfile, os, requests, hashlib, time as time_module
+    import shutil, cv2, math, threading, signal
+    import urllib.parse
 
-    start_time = time.time()
+    print(f"🚀 Starting SeedVR2 on {gpu_type} @ {resolution}")
+    _update_job_progress(job_id, "🚀 Initializing upscaler...")
 
-    # Set progress helper
-    def set_progress(text: str):
-        try:
-            progress_dict[job_id] = {"text": text, "timestamp": time.time()}
-            print(f"[{job_id}] {text}")
-        except Exception as e:
-            print(f"⚠️ Failed to update progress: {e}")
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
-    set_progress(f"🚀 Starting upscale to {resolution}")
+    repo_dir = tempfile.mkdtemp(prefix="seedvr_")
+    _update_job_progress(job_id, "📂 Cloning repository...")
+    try:
+        subprocess.run(
+            ["git", "clone", "https://github.com/Aifnet-com/SeedVR2_Video_Upscaler.git", repo_dir],
+            check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Git clone failed: {e.stderr}")
+        raise
+    os.chdir(repo_dir)
 
-    # Select GPU based on resolution
-    if resolution in ["720p", "1080p"]:
-        gpu_request = modal.gpu.H100(count=1)
-        gpu_name = "H100"
-    else:
-        gpu_request = modal.gpu.H200(count=1)
-        gpu_name = "H200"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.mp4")
+        output_tmp = os.path.join(tmpdir, "output.mp4")
 
-    # Acquire the GPU
-    with gpu_request:
-        set_progress(f"🖥️ Acquired {gpu_name} GPU")
+        # Input fetch/prepare
+        if video_url:
+            _update_job_progress(job_id, "📥 Downloading video...")
+            r = requests.get(video_url, stream=True, timeout=300)
+            r.raise_for_status()
+            with open(input_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            url_hash = hashlib.md5(video_url.encode()).hexdigest()[:8]
+        elif video_base64:
+            _update_job_progress(job_id, "📥 Decoding video...")
+            from base64 import b64decode as _b64
+            with open(input_path, "wb") as f:
+                f.write(_b64(video_base64))
+            url_hash = hashlib.md5(video_base64.encode()).hexdigest()[:8]
+        else:
+            raise Exception("Must provide either video_url or video_base64")
 
-        # Create work directory
-        work_dir = f"/tmp/upscale_{job_id}"
-        os.makedirs(work_dir, exist_ok=True)
+        input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
 
-        input_path = f"{work_dir}/input.mp4"
-        output_path = f"{work_dir}/output.mp4"
+        # Probe
+        _update_job_progress(job_id, "📐 Analyzing video...")
+        cap = cv2.VideoCapture(input_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if w == 0 or h == 0:
+            raise Exception(f"Could not read input dimensions ({w}x{h})")
 
-        try:
-            # Download or decode input video
-            if video_base64:
-                set_progress("📥 Decoding base64 video...")
-                video_data = base64.b64decode(video_base64)
-                with open(input_path, "wb") as f:
-                    f.write(video_data)
+        # Timeouts
+        stall_timeout = _calculate_stall_timeout(resolution, batch_size)
+
+        # Target dims by pixel budget (rounded to /16)
+        target_pixels_map = {"720p": 921600, "1080p": 2073600, "2k": 3686400, "4k": 8294400}
+        tgt = target_pixels_map.get(resolution, 2073600)
+        ratio = math.sqrt(tgt / (w * h))
+        out_w = round((w * ratio) / 16) * 16
+        out_h = round((h * ratio) / 16) * 16
+        res_px = min(out_w, out_h)
+
+        # Build CLI
+        cmd = [
+            "python", "inference_cli.py",
+            "--video_path", input_path,
+            "--batch_size", str(batch_size),
+            "--temporal_overlap", str(temporal_overlap),
+            "--stitch_mode", stitch_mode,
+            "--model", model,
+            "--resolution", str(res_px),
+            "--model_dir", "/models",
+            "--output", output_tmp,
+            "--debug",
+        ]
+
+        _update_job_progress(job_id, "🔧 Starting upscale process...")
+
+        # Run with streaming + watchdog
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=repo_dir,
+            preexec_fn=os.setsid
+        )
+
+        lines = []
+        last_heartbeat = time_module.time()
+        stalled_kill = False
+        is_first_batch = True
+
+        def watchdog():
+            nonlocal stalled_kill, last_heartbeat, is_first_batch
+            while proc.poll() is None:
+                time_module.sleep(10)
+                if time_module.time() - last_heartbeat > stall_timeout:
+                    print("🚨 WATCHDOG: stalled, killing process group")
+                    stalled_kill = True
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        time_module.sleep(2)
+                        if proc.poll() is None:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception as e:
+                        print(f"⚠️ watchdog kill error: {e}")
+                    break
+
+        import threading as _t
+        _t.Thread(target=watchdog, daemon=True).start()
+
+        for line in iter(proc.stdout.readline, ''):
+            if not line:
+                break
+            line = line.rstrip()
+            lines.append(line)
+            print(line)  # modal logs
+            # heuristics for progress
+            p = None
+            if "Window" in line and "-" in line:
+                p = line.strip()
+            elif "Time batch:" in line:
+                p = line.strip()
+                if is_first_batch:
+                    is_first_batch = False
+            elif "Batch" in line and "/" in line:
+                p = line.strip()
+            elif "Loading model" in line or "Model loaded" in line:
+                p = "⚙️ " + line.strip()
+            elif "Downloading" in line:
+                p = "⬇️ " + line.strip()
+            elif "Processing" in line and "frames" in line:
+                p = "🎬 " + line.strip()
+
+            if p:
+                _update_job_progress(job_id, p)
+                last_heartbeat = time_module.time()
+            elif line.strip():
+                last_heartbeat = time_module.time()
+
+        proc.wait()
+        if stalled_kill:
+            raise Exception(f"Job stalled (>{stall_timeout}s) and was killed")
+        if proc.returncode != 0:
+            tail = "\n".join(lines[-20:])
+            raise Exception(f"Upscaling failed:\n{tail}")
+        if not os.path.exists(output_tmp):
+            raise Exception("Output file not created")
+
+        # ------------------------------------------------------------------
+        # ✅ Re-encode with H.264 for optimal quality & web playback
+        # ------------------------------------------------------------------
+        _update_job_progress(job_id, "🎞️ Re-encoding output with libx264 (CRF 18)...")
+        reencoded_path = os.path.join(tmpdir, "output_final.mp4")
+
+        cmd = [
+            "ffmpeg", "-y", "-nostdin",
+            "-hide_banner", "-loglevel", "info",
+            "-i", output_tmp,
+            "-c:v", "libx264",
+            "-profile:v", "high",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-preset", "medium",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            reencoded_path
+        ]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in iter(proc.stdout.readline, ''):
+            if line.strip():
+                print("🎬 [ffmpeg]", line.strip())
+        proc.wait(timeout=60)
+
+        if proc.returncode != 0 or not os.path.exists(reencoded_path):
+            raise Exception("❌ ffmpeg re-encode failed or produced no output")
+
+        print("✅ Re-encoded successfully with H.264 + faststart", flush=True)
+
+        # ------------------------------------------------------------------
+        # 🎧 Merge original audio (if exists) back into the upscaled video
+        # ------------------------------------------------------------------
+        _update_job_progress(job_id, "🎧 Restoring original audio track...")
+        audio_path = os.path.join(tmpdir, "audio.m4a")
+        merged_path = os.path.join(tmpdir, "output_final_audio.mp4")
+
+        # Extract audio safely
+        extract_cmd = [
+            "ffmpeg", "-y", "-nostdin", "-hide_banner",
+            "-i", input_path, "-vn", "-acodec", "copy", audio_path
+        ]
+        subprocess.run(extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Merge only if audio was extracted successfully
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1024:
+            merge_cmd = [
+                "ffmpeg", "-y", "-nostdin", "-hide_banner",
+                "-i", reencoded_path,
+                "-i", audio_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                merged_path
+            ]
+            proc = subprocess.Popen(merge_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in iter(proc.stdout.readline, ''):
+                if line.strip():
+                    print("🎬 [audio merge]", line.strip())
+            proc.wait(timeout=300)
+            if proc.returncode != 0 or not os.path.exists(merged_path):
+                print("⚠️ Audio merge failed, keeping video-only output")
             else:
-                set_progress(f"📥 Downloading video...")
-                resp = requests.get(video_url, timeout=60)
-                resp.raise_for_status()
-                with open(input_path, "wb") as f:
-                    f.write(resp.content)
+                print("✅ Audio merged successfully", flush=True)
+                output_tmp = merged_path
+        else:
+            print("ℹ️ No audio track found or extraction failed, skipping merge")
+        # ------------------------------------------------------------------
 
-            # Get input file size
-            input_size_mb = round(os.path.getsize(input_path) / (1024 * 1024), 2)
-            set_progress(f"📊 Input size: {input_size_mb} MB")
+        output_size_mb = os.path.getsize(output_tmp) / (1024 * 1024)
+        _update_job_progress(job_id, "✅ Uploading to Bunny Storage...")
 
-            # Get video dimensions & frame count
-            cap = cv2.VideoCapture(input_path)
-            orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
+        # -------- Upload to Bunny Storage (DIRECT CDN URL) --------
+        # Derive clean base name from original URL (or fallback to hash)
+        parsed_url = urllib.parse.urlparse(video_url)
+        base_name = os.path.basename(parsed_url.path) or f"video_{url_hash}.mp4"
+        name_root, _ = os.path.splitext(base_name)
 
-            set_progress(f"📹 Original: {orig_width}x{orig_height} @ {fps:.1f}fps, {total_frames} frames")
+        # Final filename: <original>_<resolution>.mp4
+        _, _, _, _BUNNY_BASE_URL, BUNNY_ROOT_DIR = _bunny_cfg()
+        filename = f"{name_root}_{resolution}.mp4"
+        zone_rel_path = f"{BUNNY_ROOT_DIR}/{filename}"
+        cdn_url = upload_to_bunny_storage(output_tmp, zone_rel_path)
+        print(f"✅ Uploaded to Bunny Storage: {cdn_url}")
 
-            # Resolution mapping
-            resolution_map = {
-                "720p": 1280,
-                "1080p": 1920,
-                "2k": 2560,
-                "4k": 3840,
-            }
-            target_width = resolution_map.get(resolution, 1920)
+        # Signal success via progress_dict (visible to fallback)
+        _update_job_progress(job_id, f"✅ Upload complete: {cdn_url}")
 
-            # Calculate target height maintaining aspect ratio
-            aspect_ratio = orig_height / orig_width
-            target_height = int(target_width * aspect_ratio)
+    # Cleanup repo
+    os.chdir("/root")
+    import shutil as _sh
+    _sh.rmtree(repo_dir, ignore_errors=True)
 
-            # Ensure even dimensions
-            if target_height % 2 != 0:
-                target_height += 1
-
-            # Check if upscaling needed
-            scale_factor = target_width / orig_width
-            if scale_factor <= 1.0:
-                set_progress(f"⚠️ Video is already {orig_width}x{orig_height}, no upscaling needed")
-                shutil.copy(input_path, output_path)
-            else:
-                set_progress(f"🎯 Target: {target_width}x{target_height} (scale: {scale_factor:.2f}x)")
-
-                # Clone SeedVR2 repo if not exists
-                repo_dir = "/tmp/SeedVR2"
-                if not os.path.exists(repo_dir):
-                    set_progress("📦 Cloning SeedVR2 repository...")
-                    subprocess.run([
-                        "git", "clone", "--depth", "1",
-                        "https://github.com/Seedifyfund/SeedVR2",
-                        repo_dir
-                    ], check=True)
-
-                # Prepare paths
-                sys.path.insert(0, repo_dir)
-                os.chdir(repo_dir)
-
-                # Import SeedVR2 components
-                set_progress("🔧 Loading SeedVR2 models...")
-                from configs import create_model_config, create_pipeline_config
-                from pipelines.upscaling_pipeline import UpscalingPipeline
-
-                # Configure model - reduce memory usage
-                model_cfg = create_model_config()
-                model_cfg.model.conditioning_channels = 3
-                model_cfg.training.use_ema = False
-
-                # Optimize for memory
-                torch.cuda.empty_cache()
-                torch.backends.cudnn.benchmark = True
-                torch.backends.cuda.matmul.allow_tf32 = True
-
-                # Initialize pipeline
-                pipeline_cfg = create_pipeline_config()
-                pipeline = UpscalingPipeline(
-                    model_config=model_cfg,
-                    pipeline_config=pipeline_cfg,
-                    device="cuda",
-                    dtype=torch.float16,
-                )
-
-                # Load checkpoint
-                checkpoint_path = "/models/seedvr2_upscaler.safetensors"
-                if not os.path.exists(checkpoint_path):
-                    set_progress("📥 Downloading model weights...")
-                    url = "https://huggingface.co/yuvalkirstain/SeedVR2-upscaling/resolve/main/seedvr2_upscaler.safetensors"
-                    subprocess.run(["wget", "-q", "-O", checkpoint_path, url], check=True)
-
-                pipeline.load_checkpoint(checkpoint_path)
-                set_progress("✅ Model loaded successfully")
-
-                # Process video
-                set_progress("🎬 Starting video processing...")
-                processed_frames = []
-                batch_size = 1
-
-                cap = cv2.VideoCapture(input_path)
-                frame_idx = 0
-
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-
-                    if frame_idx % 10 == 0:
-                        progress_pct = int((frame_idx / total_frames) * 100)
-                        set_progress(f"🔄 Processing frame {frame_idx}/{total_frames} ({progress_pct}%)")
-
-                    # Resize frame
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame_resized = cv2.resize(frame_rgb, (target_width, target_height),
-                                              interpolation=cv2.INTER_LANCZOS4)
-
-                    # Convert to tensor
-                    frame_tensor = torch.from_numpy(frame_resized).permute(2, 0, 1).float() / 255.0
-                    frame_tensor = frame_tensor.unsqueeze(0).to("cuda")
-
-                    # Apply upscaling model
-                    with torch.no_grad():
-                        enhanced = pipeline.enhance_frame(frame_tensor)
-                        enhanced_np = (enhanced.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
-
-                    # Convert back to BGR
-                    enhanced_bgr = cv2.cvtColor(enhanced_np, cv2.COLOR_RGB2BGR)
-                    processed_frames.append(enhanced_bgr)
-
-                    frame_idx += 1
-
-                    # Clear memory periodically
-                    if frame_idx % 50 == 0:
-                        torch.cuda.empty_cache()
-
-                cap.release()
-
-                # Write output video
-                set_progress(f"💾 Encoding {len(processed_frames)} frames to {resolution}...")
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_path, fourcc, fps, (target_width, target_height))
-
-                for frame in processed_frames:
-                    out.write(frame)
-                out.release()
-
-                # Clean up memory
-                del processed_frames
-                torch.cuda.empty_cache()
-
-            # Get output size
-            output_size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 2)
-            set_progress(f"📊 Output size: {output_size_mb} MB")
-
-            # Upload to Bunny Storage
-            set_progress("☁️ Uploading to Bunny Storage...")
-            _, _, _, _, root_dir = _bunny_cfg()
-
-            # Generate filename with resolution
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{job_id}_{resolution}_{timestamp}.mp4"
-            zone_rel_path = f"{root_dir}/{filename}"
-
-            cdn_url = upload_to_bunny_storage(output_path, zone_rel_path)
-
-            set_progress(f"Upload complete: {cdn_url}")
-
-            # Clean up
-            shutil.rmtree(work_dir, ignore_errors=True)
-
-            elapsed_time = round(time.time() - start_time, 2)
-
-            # Return success result
-            return {
-                "status": "completed",
-                "download_url": cdn_url,
-                "filename": filename,
-                "input_size_mb": input_size_mb,
-                "output_size_mb": output_size_mb,
-                "elapsed_seconds": elapsed_time,
-                "progress": f"✅ Completed in {elapsed_time}s"
-            }
-
-        except Exception as e:
-            import traceback
-            error_msg = f"❌ Error: {str(e)}\n{traceback.format_exc()}"
-            set_progress(error_msg)
-
-            # Clean up on error
-            shutil.rmtree(work_dir, ignore_errors=True)
-
-            raise RuntimeError(error_msg)
+    return {
+        "filename": filename,
+        "input_size_mb": input_size_mb,
+        "output_size_mb": output_size_mb,
+        "cdn_url": cdn_url,   # direct file URL
+    }
 
 
-# ---------------- FastAPI Web Service ----------------
+# ---------------- GPU wrappers ----------------
 
 @app.function(
     image=image,
+    gpu="H100",
+    timeout=7200,
     secrets=[bunny_secret],
-    keep_warm=1,
-    allow_concurrent_inputs=10,
-    timeout=86400,
+    volumes={"/models": model_volume, "/outputs": output_volume},
+    scaledown_window=300,
+    max_containers=10,
+)
+def upscale_video_h100(
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    batch_size: int = 100,
+    temporal_overlap: int = 12,
+    stitch_mode: str = "crossfade",
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    resolution: str = "1080p",
+    job_id: Optional[str] = None,
+):
+    return _upscale_video_impl(
+        video_url, video_base64, batch_size, temporal_overlap,
+        stitch_mode, model, resolution, gpu_type="H100", job_id=job_id
+    )
+
+@app.function(
+    image=image,
+    gpu="H200",
+    timeout=7200,
+    secrets=[bunny_secret],
+    volumes={"/models": model_volume, "/outputs": output_volume},
+    scaledown_window=300,
+    max_containers=10,
+)
+def upscale_video_h200(
+    video_url: Optional[str] = None,
+    video_base64: Optional[str] = None,
+    batch_size: int = 100,
+    temporal_overlap: int = 12,
+    stitch_mode: str = "crossfade",
+    model: str = "seedvr2_ema_7b_fp16.safetensors",
+    resolution: str = "1080p",
+    job_id: Optional[str] = None,
+):
+    return _upscale_video_impl(
+        video_url, video_base64, batch_size, temporal_overlap,
+        stitch_mode, model, resolution, gpu_type="H200", job_id=job_id
+    )
+
+# ---------------- FastAPI app ----------------
+
+@app.function(
+    image=image,
+    timeout=7200,
+    secrets=[bunny_secret],
+    scaledown_window=60,
+    volumes={"/outputs": output_volume},
 )
 @modal.asgi_app()
 def fastapi_app():
     from fastapi import FastAPI, HTTPException
-    from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
-    import time
-    import json as _json
-    import uuid
-    import asyncio
-    import os
+    import time, uuid, os, asyncio, json as _json
+    import threading as _thread
 
-    web_app = FastAPI(title="SeedVR2 Upscaler API")
+    web_app = FastAPI()
 
-    # Enable CORS
-    web_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # Local job cache (simple; okay since one web app handles status)
+    JOBS_DIR = "/outputs/jobs"
+    os.makedirs(JOBS_DIR, exist_ok=True)
 
-    # Request/Response models
+    def save_job(job_id: str, job_data: dict):
+        try:
+            with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
+                _json.dump(job_data, f)
+        except Exception as e:
+            print(f"⚠️ save_job error: {e}")
+
+    def load_job(job_id: str):
+        try:
+            path = f"{JOBS_DIR}/{job_id}.json"
+            if not os.path.exists(path):
+                return None
+            with open(path, "r") as f:
+                return _json.load(f)
+        except Exception as e:
+            print(f"⚠️ load_job error: {e}")
+            return None
+
     class UpscaleRequest(BaseModel):
         video_url: Optional[str] = None
         video_base64: Optional[str] = None
+        batch_size: int = 100
+        temporal_overlap: int = 12
+        stitch_mode: str = "crossfade"
+        model: str = "seedvr2_ema_7b_fp16.safetensors"
         resolution: str = "1080p"
 
     class JobResponse(BaseModel):
         job_id: str
         status: str
         message: str
-        gpu_type: Optional[str] = None
+        gpu_type: str
 
     class JobStatus(BaseModel):
         job_id: str
         status: str
         progress: Optional[str] = None
-        download_url: Optional[str] = None
+        download_url: Optional[str] = None  # direct CDN URL
         filename: Optional[str] = None
         input_size_mb: Optional[float] = None
         output_size_mb: Optional[float] = None
         error: Optional[str] = None
         elapsed_seconds: Optional[float] = None
 
-    # Simple file-based job storage
-    JOBS_DIR = "/tmp/seedvr2_jobs"
-    os.makedirs(JOBS_DIR, exist_ok=True)
-
-    def save_job(job_id: str, data: dict):
-        with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
-            _json.dump(data, f)
-
-    def load_job(job_id: str) -> dict:
-        path = f"{JOBS_DIR}/{job_id}.json"
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return _json.load(f)
-        return None
-
-    def try_promote_from_cdn(job_id: str, request_data: dict) -> bool:
+    def try_promote_from_cdn(job_id: str, request_payload: dict) -> bool:
         """
-        Try to find the output file in Bunny CDN and promote job to completed.
-        Returns True if successfully promoted.
+        Upload watchdog: If file exists on CDN, promote job to completed.
+        Returns True if promoted, False otherwise.
         """
+        import urllib.parse, os as _os
+
         try:
-            from datetime import datetime
+            # Reconstruct expected CDN URL from request
+            video_url = request_payload.get("video_url", "")
+            resolution = request_payload.get("resolution", "1080p")
 
-            # Build expected path patterns
-            resolution = request_data.get("resolution", "1080p")
-            _, _, _, base_url, root_dir = _bunny_cfg()
+            if not video_url:
+                return False
 
-            # Try common filename patterns
-            patterns = [
-                f"{job_id}_{resolution}_",  # Our standard pattern
-                f"{job_id}_",                # Fallback
-            ]
+            # Use derive_output_paths helper
+            filename, zone_rel_path, cdn_url = derive_output_paths(video_url, resolution)
 
-            # Check if file exists in Bunny
-            for pattern in patterns:
-                # We need to check multiple possible timestamps
-                # Since we don't know exact timestamp, we'll check if any file with our pattern exists
-                # This is a simplified check - in production you might want to list directory
+            # Check if file exists on CDN
+            exists, size = cdn_file_exists(cdn_url)
 
-                # For now, we'll construct the most likely filename
-                # (this assumes the upload happened recently)
-                for minutes_ago in range(0, 10):  # Check last 10 minutes
-                    check_time = datetime.now()
-                    # Try a few timestamp formats
-                    timestamp = check_time.strftime("%Y%m%d_%H%M%S")
-                    filename = f"{pattern}{timestamp}.mp4"
-                    zone_rel_path = f"{root_dir}/{filename}"
+            if exists:
+                job_data = load_job(job_id) or {}
 
-                    if check_bunny_file_exists(zone_rel_path):
-                        cdn_url = f"{base_url}/{zone_rel_path}"
+                # Don't overwrite if already completed
+                if job_data.get("status") == "completed":
+                    return True
 
-                        # Update job to completed
-                        job_data = load_job(job_id) or {}
+                job_data.update({
+                    "status": "completed",
+                    "download_url": cdn_url,
+                    "filename": filename,
+                    "output_size_mb": size / (1024 * 1024) if size else None,
+                    "progress": "✅ Completed via CDN watchdog",
+                })
+                save_job(job_id, job_data)
+
+                print(f"✅ CDN Watchdog: Promoted {job_id} to completed ({cdn_url})")
+
+                # Clear progress_dict
+                try:
+                    if job_id in progress_dict:
+                        del progress_dict[job_id]
+                except Exception:
+                    pass
+
+                return True
+        except Exception as e:
+            print(f"⚠️ try_promote_from_cdn error: {e}")
+
+        return False
+
+    def fallback_complete(job_id: str, request: UpscaleRequest):
+        """
+        Fallback thread: Waits for ETA, then checks CDN periodically.
+        Promotes job to completed if file appears, even if main thread hangs.
+        """
+        import time as _t
+
+        # Determine expected CDN URL
+        expected_filename, _expected_zone_rel, expected_cdn_url = derive_output_paths(
+            request.video_url or "", request.resolution
+        )
+
+        # Calculate ETA
+        meta = probe_video_meta(request.video_url) if request.video_url else None
+        frames = (meta or {}).get("frames", 300)
+        eta = max(estimate_eta_seconds(frames, request.resolution), 90)
+
+        print(f"🔄 Fallback started for {job_id}, ETA {eta}s ({eta/60:.1f}min)")
+
+        # Start checking at 60% of ETA to handle early completions and variance
+        initial_wait = int(eta * 0.60)
+        _t.sleep(initial_wait)
+
+        # Check 20 times at 25s intervals = 500s window
+        # This provides robust coverage for timing variance
+        num_checks = 20
+        check_interval = 25
+
+        for attempt in range(num_checks):
+            # Check 1: progress_dict for success marker
+            try:
+                progress_data = progress_dict.get(job_id, {})
+                progress_text = progress_data.get("text", "") if isinstance(progress_data, dict) else str(progress_data)
+
+                if "Upload complete:" in progress_text:
+                    # Extract CDN URL from progress
+                    cdn_url_from_progress = progress_text.split("Upload complete:")[-1].strip()
+
+                    job_data = load_job(job_id) or {}
+                    if job_data.get("status") != "completed":
                         job_data.update({
                             "status": "completed",
-                            "download_url": cdn_url,
-                            "filename": filename,
-                            "progress": "✅ Completed (recovered from CDN)"
+                            "progress": "✅ Completed via fallback (progress detection)",
+                            "download_url": cdn_url_from_progress,
+                            "filename": expected_filename,
                         })
                         save_job(job_id, job_data)
+                        print(f"✅ Fallback: Detected success in progress_dict for {job_id}")
 
-                        # Clear progress dict
                         try:
                             if job_id in progress_dict:
                                 del progress_dict[job_id]
                         except Exception:
                             pass
+                    return
+            except Exception as e:
+                print(f"⚠️ Fallback progress check error: {e}")
 
-                        print(f"✅ Promoted job {job_id} from CDN: {cdn_url}")
-                        return True
+            # Check 2: CDN file existence
+            ok, size = cdn_file_exists(expected_cdn_url)
+            if ok:
+                job_data = load_job(job_id) or {}
+                if job_data.get("status") != "completed":
+                    job_data.update({
+                        "status": "completed",
+                        "progress": "✅ Completed via fallback (CDN detection)",
+                        "download_url": expected_cdn_url,
+                        "filename": expected_filename,
+                        "output_size_mb": size / (1024 * 1024) if size else None,
+                    })
+                    save_job(job_id, job_data)
+                    print(f"✅ Fallback: Found CDN file for {job_id}")
 
-            return False
+                    try:
+                        if job_id in progress_dict:
+                            del progress_dict[job_id]
+                    except Exception:
+                        pass
+                return
 
-        except Exception as e:
-            print(f"⚠️ Error promoting from CDN: {e}")
-            return False
+            if attempt < num_checks - 1:
+                elapsed = initial_wait + (attempt * check_interval)
+                print(f"⚠️ Fallback check {attempt+1}/{num_checks}: not found (elapsed {elapsed}s)")
+                _t.sleep(check_interval)
+
+        # After all retries: mark as failed
+        job_data = load_job(job_id) or {}
+        if job_data.get("status") not in ("completed", "failed"):
+            job_data.update({
+                "status": "failed",
+                "error": "❌ Fallback timeout: output file not found on BunnyCDN",
+                "progress": "❌ Job failed: output file missing",
+            })
+            save_job(job_id, job_data)
+            try:
+                if job_id in progress_dict:
+                    del progress_dict[job_id]
+            except Exception:
+                pass
+            print(f"❌ Fallback: job {job_id} failed - file never appeared")
 
     def process_video(job_id: str, request: UpscaleRequest):
-        """Background task to process video"""
         try:
             job_data = load_job(job_id) or {}
-            job_data.update({"status": "processing", "progress": "🔄 Starting GPU container..."})
+            job_data.update({"status": "processing", "progress": "Starting upscaler..."})
             save_job(job_id, job_data)
 
-            # Call the GPU function
-            with process_upscale.remote(
-                job_id=job_id,
-                video_url=request.video_url,
-                resolution=request.resolution,
-                video_base64=request.video_base64,
-            ) as handle:
-                result = handle
+            # Choose GPU
+            if request.resolution in ["720p", "1080p"]:
+                res = upscale_video_h100.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution,
+                    job_id=job_id,
+                )
+            else:
+                res = upscale_video_h200.remote(
+                    video_url=request.video_url,
+                    video_base64=request.video_base64,
+                    batch_size=request.batch_size,
+                    temporal_overlap=request.temporal_overlap,
+                    stitch_mode=request.stitch_mode,
+                    model=request.model,
+                    resolution=request.resolution,
+                    job_id=job_id,
+                )
 
-            # Update job with result
+            # Persist results (normal completion)
             job_data = load_job(job_id) or {}
-            job_data.update(result)
+
+            # CRITICAL: Don't overwrite if fallback already completed this job!
+            if job_data.get("status") == "completed" and "fallback" in job_data.get("progress", ""):
+                print(f"⚠️ Job {job_id} already completed by fallback, skipping main thread update")
+                return
+
+            job_data.update({
+                "status": "completed",
+                "download_url": res["cdn_url"],   # direct CDN file
+                "filename": res["filename"],
+                "input_size_mb": res["input_size_mb"],
+                "output_size_mb": res["output_size_mb"],
+                "progress": "✅ Completed successfully!",
+            })
             save_job(job_id, job_data)
 
-            # Clear progress_dict on completion
+            # Clear progress entry
             try:
                 if job_id in progress_dict:
                     del progress_dict[job_id]
@@ -625,11 +869,12 @@ def fastapi_app():
             # Truly unknown job id
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # Calculate elapsed time
+        # --- Upload Watchdog (only when we have a real job_data dict) ---
+        progress_text = (realtime or job_data.get("progress") or "")
         created_at = job_data.get("created_at")
         elapsed = (time.time() - created_at) if created_at else 0.0
 
-        # === NEW: Check for stuck pending jobs ===
+        # Check for jobs stuck in pending (never started processing)
         if job_data.get("status") == "pending" and elapsed > 120:  # 2 min pending
             # Job never started - likely Modal scheduling issue
             job_data.update({
@@ -638,17 +883,6 @@ def fastapi_app():
                 "progress": "❌ Failed to start"
             })
             save_job(job_id, job_data)
-
-            # Clear progress_dict
-            try:
-                if job_id in progress_dict:
-                    del progress_dict[job_id]
-            except Exception:
-                pass
-        # === End pending check ===
-
-        # --- Upload Watchdog (only when we have a real job_data dict) ---
-        progress_text = (realtime or job_data.get("progress") or "")
 
         # If stuck on uploading for a while, try promote from CDN
         if job_data.get("status") in ("pending", "processing"):
@@ -734,18 +968,12 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "status": "healthy",
-            "active_jobs": active,
+            "version": "4.2 - Bunny Storage (direct URL) + CDN fallback",
             "endpoints": {
-                "POST /upscale": "Submit new upscaling job",
-                "GET /status/{job_id}": "Check job status",
+                "submit_job": "POST /upscale",
+                "check_status": "GET /status/{job_id}",
             },
-            "resolutions": ["720p", "1080p", "2k", "4k"],
+            "active_jobs": active,
         }
 
     return web_app
-
-
-# Entry point for Modal deployment
-if __name__ == "__main__":
-    app.deploy()
