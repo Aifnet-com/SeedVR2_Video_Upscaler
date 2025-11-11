@@ -872,10 +872,10 @@ def fastapi_app():
         # --- Upload Watchdog (only when we have a real job_data dict) ---
         progress_text = (realtime or job_data.get("progress") or "")
         created_at = job_data.get("created_at")
-        elapsed = (time.time() - created_at) if created_at else 0.0
+        elapsed = (time.time() - created_at) if created_at else None
 
         # Check for jobs stuck in pending (never started processing)
-        if job_data.get("status") == "pending" and elapsed > 120:  # 2 min pending
+        if job_data.get("status") == "pending" and elapsed is not None and elapsed > 120:  # 2 min pending
             # Job never started - likely Modal scheduling issue
             job_data.update({
                 "status": "failed",
@@ -883,6 +883,13 @@ def fastapi_app():
                 "progress": "❌ Failed to start"
             })
             save_job(job_id, job_data)
+
+            # Clear progress_dict to prevent memory leaks
+            try:
+                if job_id in progress_dict:
+                    del progress_dict[job_id]
+            except Exception:
+                pass
 
         # If stuck on uploading for a while, try promote from CDN
         if job_data.get("status") in ("pending", "processing"):
@@ -935,6 +942,7 @@ def fastapi_app():
         if realtime:
             job_data["progress"] = realtime
 
+        # Recalculate elapsed for final response
         created_at = job_data.get("created_at")
         elapsed = (time.time() - created_at) if created_at else None
 

@@ -66,7 +66,7 @@ while true; do
     STATUS=$(curl -s "$API_URL/status/$JOB_ID")
     STATE=$(echo $STATUS | jq -r '.status' 2>/dev/null)
 
-    # Handle initial sync delay (404s)
+    # Handle initial sync delay (404s or null state)
     if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
         NOW=$(date +%s)
         WAIT_TIME=$((NOW - REGISTRATION_START))
@@ -92,6 +92,15 @@ while true; do
             sleep 2
             continue
         fi
+    fi
+
+    # If we got a state, check if it's a failure (even during registration phase)
+    if [ "$STATE" = "failed" ]; then
+        printf "\r\033[K"
+        echo ""
+        ERROR=$(echo $STATUS | jq -r '.error')
+        echo "❌ Job failed: $ERROR"
+        exit 1
     fi
 
     ELAPSED=$(echo $STATUS | jq -r '.elapsed_seconds')
