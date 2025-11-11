@@ -643,107 +643,6 @@ def fastapi_app():
 
         return False
 
-    def fallback_complete(job_id: str, request: UpscaleRequest):
-        """
-        Fallback thread: Waits for ETA, then checks CDN periodically.
-        Promotes job to completed if file appears, even if main thread hangs.
-        """
-        import time as _t
-
-        # Determine expected CDN URL
-        expected_filename, _expected_zone_rel, expected_cdn_url = derive_output_paths(
-            request.video_url or "", request.resolution
-        )
-
-        # Calculate ETA
-        meta = probe_video_meta(request.video_url) if request.video_url else None
-        frames = (meta or {}).get("frames", 300)
-        eta = max(estimate_eta_seconds(frames, request.resolution), 90)
-
-        print(f"🔄 Fallback started for {job_id}, ETA {eta}s ({eta/60:.1f}min)")
-
-        # Start checking at 60% of ETA to handle early completions and variance
-        initial_wait = int(eta * 0.60)
-        _t.sleep(initial_wait)
-
-        # Check 20 times at 25s intervals = 500s window
-        # This provides robust coverage for timing variance
-        num_checks = 20
-        check_interval = 25
-
-        for attempt in range(num_checks):
-            # Check 1: progress_dict for success marker
-            try:
-                progress_data = progress_dict.get(job_id, {})
-                progress_text = progress_data.get("text", "") if isinstance(progress_data, dict) else str(progress_data)
-
-                if "Upload complete:" in progress_text:
-                    # Extract CDN URL from progress
-                    cdn_url_from_progress = progress_text.split("Upload complete:")[-1].strip()
-
-                    job_data = load_job(job_id) or {}
-                    if job_data.get("status") != "completed":
-                        job_data.update({
-                            "status": "completed",
-                            "progress": "✅ Completed via fallback (progress detection)",
-                            "download_url": cdn_url_from_progress,
-                            "filename": expected_filename,
-                        })
-                        save_job(job_id, job_data)
-                        print(f"✅ Fallback: Detected success in progress_dict for {job_id}")
-
-                        try:
-                            if job_id in progress_dict:
-                                del progress_dict[job_id]
-                        except Exception:
-                            pass
-                    return
-            except Exception as e:
-                print(f"⚠️ Fallback progress check error: {e}")
-
-            # Check 2: CDN file existence
-            ok, size = cdn_file_exists(expected_cdn_url)
-            if ok:
-                job_data = load_job(job_id) or {}
-                if job_data.get("status") != "completed":
-                    job_data.update({
-                        "status": "completed",
-                        "progress": "✅ Completed via fallback (CDN detection)",
-                        "download_url": expected_cdn_url,
-                        "filename": expected_filename,
-                        "output_size_mb": size / (1024 * 1024) if size else None,
-                    })
-                    save_job(job_id, job_data)
-                    print(f"✅ Fallback: Found CDN file for {job_id}")
-
-                    try:
-                        if job_id in progress_dict:
-                            del progress_dict[job_id]
-                    except Exception:
-                        pass
-                return
-
-            if attempt < num_checks - 1:
-                elapsed = initial_wait + (attempt * check_interval)
-                print(f"⚠️ Fallback check {attempt+1}/{num_checks}: not found (elapsed {elapsed}s)")
-                _t.sleep(check_interval)
-
-        # After all retries: mark as failed
-        job_data = load_job(job_id) or {}
-        if job_data.get("status") not in ("completed", "failed"):
-            job_data.update({
-                "status": "failed",
-                "error": "❌ Fallback timeout: output file not found on BunnyCDN",
-                "progress": "❌ Job failed: output file missing",
-            })
-            save_job(job_id, job_data)
-            try:
-                if job_id in progress_dict:
-                    del progress_dict[job_id]
-            except Exception:
-                pass
-            print(f"❌ Fallback: job {job_id} failed - file never appeared")
-
     def process_video(job_id: str, request: UpscaleRequest):
         try:
             job_data = load_job(job_id) or {}
@@ -831,8 +730,8 @@ def fastapi_app():
             "request": request.model_dump(),
         })
 
-        # Fallback now handled by auto-detection in /status endpoint
-        # (Removed asyncio fallback thread - wasn't working in Modal's environment)
+        # Note: Proactive fallback thread removed - reactive watchdogs in /status endpoint
+        # are sufficient (auto-completion detection + CDN promotion run on every status poll)
 
         # run job in background
         asyncio.create_task(asyncio.to_thread(process_video, job_id, request))
@@ -1000,7 +899,7 @@ def fastapi_app():
 
         return {
             "service": "SeedVR2 Video Upscaler",
-            "version": "4.2 - Bunny Storage (direct URL) + CDN fallback",
+            "version": "4.3 - Multi-tier timeout system + queue-aware scheduling",
             "endpoints": {
                 "submit_job": "POST /upscale",
                 "check_status": "GET /status/{job_id}",
