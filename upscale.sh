@@ -127,7 +127,19 @@ while true; do
     else
         MINS=$((${ELAPSED%.*} / 60))
         SECS=$((${ELAPSED%.*} % 60))
-        printf "\r\033[K⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
+
+        # Add helpful context for pending jobs
+        if [ "$STATE" = "pending" ]; then
+            if [ ${ELAPSED%.*} -gt 60 ]; then
+                printf "\r\033[K⏳ Status: $STATE (waiting in job queue) - Elapsed: ${MINS}m ${SECS}s"
+            else
+                printf "\r\033[K⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
+            fi
+        elif [ "$STATE" = "processing" ] && [[ "$PROGRESS" == *"Starting"* ]]; then
+            printf "\r\033[K⏳ Status: Waiting for GPU assignment - Elapsed: ${MINS}m ${SECS}s"
+        else
+            printf "\r\033[K⏳ Status: $STATE [$PROGRESS] - Elapsed: ${MINS}m ${SECS}s"
+        fi
     fi
 
     sleep 5

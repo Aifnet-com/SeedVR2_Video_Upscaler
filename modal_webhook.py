@@ -747,7 +747,13 @@ def fastapi_app():
     def process_video(job_id: str, request: UpscaleRequest):
         try:
             job_data = load_job(job_id) or {}
-            job_data.update({"status": "processing", "progress": "Starting upscaler..."})
+
+            # Mark that we've reached the processing function (not stuck in scheduling)
+            job_data.update({
+                "status": "processing",
+                "progress": "Starting upscaler...",
+                "queued_at": time.time()  # Track when we entered Modal's GPU queue
+            })
             save_job(job_id, job_data)
 
             # Choose GPU
@@ -869,27 +875,45 @@ def fastapi_app():
             # Truly unknown job id
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # --- Upload Watchdog (only when we have a real job_data dict) ---
+        # --- Timeout Watchdogs ---
         progress_text = (realtime or job_data.get("progress") or "")
         created_at = job_data.get("created_at")
+        queued_at = job_data.get("queued_at")
         elapsed = (time.time() - created_at) if created_at else None
 
-        # Check for jobs stuck in pending (never started processing)
-        if job_data.get("status") == "pending" and elapsed is not None and elapsed > 120:  # 2 min pending
-            # Job never started - likely Modal scheduling issue
-            job_data.update({
-                "status": "failed",
-                "error": "Job failed to start - Modal scheduling timeout",
-                "progress": "❌ Failed to start"
-            })
-            save_job(job_id, job_data)
+        # Watchdog 1: Jobs stuck before reaching process_video (asyncio issue)
+        if job_data.get("status") == "pending" and elapsed is not None and elapsed > 300:  # 5 min
+            if not queued_at:
+                # Job never reached process_video - asyncio.create_task likely failed
+                job_data.update({
+                    "status": "failed",
+                    "error": "Job failed to start - task scheduling timeout",
+                    "progress": "❌ Failed to start"
+                })
+                save_job(job_id, job_data)
+                try:
+                    if job_id in progress_dict:
+                        del progress_dict[job_id]
+                except Exception:
+                    pass
 
-            # Clear progress_dict to prevent memory leaks
-            try:
-                if job_id in progress_dict:
-                    del progress_dict[job_id]
-            except Exception:
-                pass
+        # Watchdog 2: Jobs waiting in Modal's GPU queue for too long (30 min max)
+        # This catches cases where Modal never assigns a GPU (rare infrastructure issue)
+        if job_data.get("status") == "processing" and queued_at:
+            queue_wait_time = time.time() - queued_at
+            # Only fail if waiting >30min AND no progress updates (frozen queue)
+            if queue_wait_time > 1800 and not realtime:  # 30 minutes
+                job_data.update({
+                    "status": "failed",
+                    "error": "Job timeout - GPU queue wait exceeded 30 minutes",
+                    "progress": "❌ GPU queue timeout"
+                })
+                save_job(job_id, job_data)
+                try:
+                    if job_id in progress_dict:
+                        del progress_dict[job_id]
+                except Exception:
+                    pass
 
         # If stuck on uploading for a while, try promote from CDN
         if job_data.get("status") in ("pending", "processing"):
