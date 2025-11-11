@@ -161,16 +161,16 @@ Container destroyed, GPU becomes available for next job.
 
 ## 7. Backup Logic (Fail-Safe Completion)
 
-When a job’s logs stop updating, a **fallback thread** ensures completion by checking if the output appears on BunnyCDN.
+When a job’s worker exits unexpectedly or fails to return control after uploading, the **`/status` endpoint** automatically performs recovery checks based on progress logs and CDN verification — no background thread required.
 
 | Step | Description |
 |:---- |:------------|
-| 🏁 Job start | Main upscaling begins + fallback starts in parallel |
-| ⏱ ETA wait | Waits for `estimate_eta_seconds()` duration |
-| 🔍 CDN check | Looks for `<video_name>_<res>.mp4` on BunnyCDN |
-| ✅ File found | Marks job as **completed** instantly |
-| 🔁 Missing file | Retries up to 3× (every 10 seconds) |
-| ❌ Timeout | Marks job as **failed** (`output file not found`) |
-| 🧠 Normal path | Regular completion overrides fallback |
+| 🧭 Poll trigger | Each `/status/{job_id}` call automatically runs backup checks. |
+| 🔍 Progress detection | If progress contains `✅ Upload complete: <cdn_url>`, the job is marked **completed (progress-based)**. |
+| 🌐 CDN check | If progress shows `uploading to bunny storage` for > 90 s, the system reconstructs `<video_name>_<res>.mp4` and performs a **HEAD request** to BunnyCDN. |
+| ✅ File found | Marks job as **completed (CDN-based)** and records the direct CDN URL + size. |
+| 🔁 Still uploading | Keeps job **processing**, to be retried automatically on the next `/status` poll. |
+| ⏱ Watchdog timeout | If no progress or GPU heartbeat is seen past watchdog limits (5 min start / 30 min queue), marks job as **failed**. |
+| 🧠 Normal path | Regular GPU completion and upload override any fallback state. |
 
-> 💡 **Why:** Prevents jobs from getting “stuck” if the main worker hangs.
+> 💡 **Why:** Stateless, polling-driven recovery ensures jobs finish even if Modal terminates the worker after upload.
