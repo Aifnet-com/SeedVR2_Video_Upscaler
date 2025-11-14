@@ -156,14 +156,11 @@ def estimate_eta_seconds(frames: int, resolution: str, batch_size: int = 100):
     model_reload_time = 45 + (12 * max(0, num_batches - 1))  # Measured: 12s per reload
     stitch_time = 2 * max(0, num_batches - 1)
 
-    # CRITICAL: Save time scales NON-LINEARLY with frames!
-    # 300 frames: ~15s = 5.0s per 100 frames
-    # 720 frames: ~55s = 7.6s per 100 frames
     save_encode_time = (7.6 * (frames / 100.0)) + 10  # Must use frames, not batches!
     upload_time = max(5, int(frames / 100.0 * 3))
 
     total = gpu_time + model_reload_time + stitch_time + save_encode_time + upload_time
-    return int(total * 1.40)  # 40% margin for safety
+    return int(total * 1.50)  # 50% margin for safety
 
 def cdn_file_exists(cdn_url: str):
     """HEAD the CDN URL; return (exists, size_bytes)."""
@@ -189,16 +186,25 @@ def _update_job_progress(job_id: str, progress_text: str):
     except Exception as e:
         print(f"⚠️ progress_dict update failed: {e}")
 
+
 def _calculate_stall_timeout(resolution: str, batch_size: int = 100) -> int:
     """
     Timeout must exceed per-batch processing time (we only log between batches).
     Empirical seconds per 100 frames:
       720p ~50, 1080p ~70, 2k ~120, 4k ~250.
+
+    IMPORTANT: Final batch includes stitching all chunks, which takes 3-5x longer.
     """
     time_per_100_frames = {"720p": 50, "1080p": 70, "2k": 120, "4k": 250}
     base = time_per_100_frames.get(resolution, 62)
     expected_batch = int(base * (batch_size / 100))
-    first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)  # add model load + slack
+
+    # For 2K/4K: Use 3x multiplier to handle stitching overhead
+    if resolution in ["2k", "4k"]:
+        first_batch_timeout = max(int((expected_batch + 45) * 3), 360)
+    else:
+        first_batch_timeout = max(int((expected_batch + 45) * 1.5), 180)
+
     return first_batch_timeout
 
 # ---------------- Core upscaler implementation ----------------
@@ -321,8 +327,24 @@ def _upscale_video_impl(
             while proc.poll() is None:
                 time_module.sleep(10)
                 if time_module.time() - last_heartbeat > stall_timeout:
-                    print("🚨 WATCHDOG: stalled, killing process group")
+                    print(f"🚨 WATCHDOG: stalled (>{stall_timeout}s), killing process group")
                     stalled_kill = True
+
+                    # CRITICAL: Save failure status BEFORE killing process
+                    # Otherwise the kill might terminate us before save completes
+                    try:
+                        job_data_wd = load_job(job_id) or {}
+                        job_data_wd.update({
+                            "status": "failed",
+                            "error": f"Job stalled (>{stall_timeout}s) and was killed by watchdog",
+                            "progress": f"❌ Watchdog timeout ({stall_timeout}s)"
+                        })
+                        save_job(job_id, job_data_wd)
+                        print(f"✅ Saved failure status for job {job_id}")
+                    except Exception as save_err:
+                        print(f"⚠️ Failed to save failure status: {save_err}")
+
+                    # Now kill the subprocess
                     try:
                         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                         time_module.sleep(2)
@@ -480,7 +502,7 @@ def _upscale_video_impl(
 @app.function(
     image=image,
     gpu="H100",
-    timeout=7200,
+    timeout=10800,
     secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
@@ -504,7 +526,7 @@ def upscale_video_h100(
 @app.function(
     image=image,
     gpu="H200",
-    timeout=7200,
+    timeout=10800,
     secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
     scaledown_window=300,
@@ -529,7 +551,7 @@ def upscale_video_h200(
 
 @app.function(
     image=image,
-    timeout=7200,
+    timeout=10800,
     secrets=[bunny_secret],
     scaledown_window=60,
     volumes={"/outputs": output_volume},
