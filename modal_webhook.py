@@ -505,7 +505,7 @@ def _upscale_video_impl(
     timeout=10800,
     secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
-    scaledown_window=300,
+    # scaledown_window=300,
     max_containers=10,
 )
 def upscale_video_h100(
@@ -529,7 +529,7 @@ def upscale_video_h100(
     timeout=10800,
     secrets=[bunny_secret],
     volumes={"/models": model_volume, "/outputs": output_volume},
-    scaledown_window=300,
+    # scaledown_window=300,
     max_containers=10,
 )
 def upscale_video_h200(
